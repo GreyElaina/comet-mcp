@@ -22,11 +22,22 @@ const TOOLS: Tool[] = [
   },
   {
     name: "comet_ask",
-    description: "Send a prompt to Comet/Perplexity (non-blocking). Use comet_poll to check progress.",
+    description: `Send a prompt to Comet/Perplexity (non-blocking). Use comet_poll to check progress.
+
+WHEN TO USE COMET vs other tools:
+- USE COMET for: tasks requiring real browser interaction (login walls, dynamic content, multi-step navigation, filling forms, clicking buttons, scraping live data from specific sites)
+- USE COMET for: deep research that benefits from Perplexity's agentic browsing (comparing multiple sources, following links, comprehensive analysis)
+- USE regular WebSearch/WebFetch for: simple factual queries, quick lookups, static content
+
+PROMPTING TIPS:
+- Give context and goals, not step-by-step instructions
+- Example: "Research the pricing models of top 3 auth providers for a B2B SaaS" (good)
+- Example: "Go to auth0.com, click pricing, then go to clerk.dev..." (less effective)
+- Comet will figure out the best browsing strategy`,
     inputSchema: {
       type: "object",
       properties: {
-        prompt: { type: "string", description: "Question or task for Comet" },
+        prompt: { type: "string", description: "Question or task for Comet - focus on goals and context" },
       },
       required: ["prompt"],
     },
