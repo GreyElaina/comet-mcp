@@ -4,7 +4,7 @@
 
 An MCP server that connects Claude Code to [Perplexity Comet](https://www.perplexity.ai/comet) - enabling agentic web browsing, deep research, and real-time task monitoring.
 
-<!-- Demo video coming soon -->
+![Demo](demo.gif)
 
 ## Why?
 
