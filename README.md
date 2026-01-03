@@ -8,19 +8,19 @@ An MCP server that connects Claude Code to [Perplexity Comet](https://www.perple
 
 ## Why?
 
-Claude Code is powerful, but it can't browse the web autonomously. Comet can browse, research, and execute multi-step web tasks - but it's isolated in a browser.
+Existing web tools for Claude Code fall short:
+- **WebSearch/WebFetch** only return static text - no interaction, no login, no dynamic content
+- **Browser automation MCPs** (like browser-use) require you to script every click - they don't *think*
 
-**comet-mcp bridges them.** Now Claude can:
-- Delegate web research to Comet's agentic browser
-- Monitor browsing progress in real-time
-- Intervene if tasks go off track
-- Get comprehensive research reports
+**Comet is different.** It's Perplexity's agentic browser - give it a goal, and it figures out how to get there. It can navigate complex sites, handle logins, fill forms, and synthesize information from multiple sources.
+
+**comet-mcp** bridges Claude Code and Comet, so you get the best of both: Claude's coding intelligence + Comet's web intelligence.
 
 ## Quick Start
 
 ### 1. Configure Claude Code
 
-Add to `~/.claude.json` (scope: user) or `.mcp.json` (scope: project):
+Add to `~/.claude.json` or `.mcp.json`:
 
 ```json
 {
@@ -28,24 +28,6 @@ Add to `~/.claude.json` (scope: user) or `.mcp.json` (scope: project):
     "comet-bridge": {
       "command": "npx",
       "args": ["-y", "comet-mcp"]
-    }
-  }
-}
-```
-
-Or install globally first:
-
-```bash
-npm install -g comet-mcp
-```
-
-Then use:
-
-```json
-{
-  "mcpServers": {
-    "comet-bridge": {
-      "command": "comet-mcp"
     }
   }
 }
@@ -67,73 +49,28 @@ You: "Use Comet to research the top AI frameworks in 2025"
 Claude: [connects to Comet, delegates research, monitors progress, returns results]
 ```
 
-## Tools (6)
+## Tools
 
 | Tool | Description |
 |------|-------------|
 | `comet_connect` | Connect to Comet (auto-starts if needed) |
-| `comet_ask` | Send a task and wait for response (blocking) |
-| `comet_poll` | Check task progress and get results |
-| `comet_stop` | Stop current task if off-track |
+| `comet_ask` | Send a task and wait for response |
+| `comet_poll` | Check task progress |
+| `comet_stop` | Stop current task |
 | `comet_screenshot` | Capture current page |
 | `comet_mode` | Switch modes: search, research, labs, learn |
-
-## Modes
-
-| Mode | Best For |
-|------|----------|
-| `search` | Quick web searches |
-| `research` | Deep, comprehensive analysis |
-| `labs` | Data visualization & analytics |
-| `learn` | Educational explanations |
-
-## Prompting Tips
-
-**Comet is for DOING, not ASKING.** Use it for tasks that require browser interaction:
-
-✅ **Good:** "Go to RevenueCat dashboard and get my production API key"
-✅ **Good:** "Research pricing models of Auth0, Clerk, and Supabase Auth"
-❌ **Bad:** "How do I generate a P8 key?" (use WebSearch instead)
-
-Focus on **goals**, not step-by-step instructions. Comet will figure out how to navigate.
-
-Use `newChat: true` to start a fresh conversation when switching topics.
-
-## Example Workflow
-
-```
-# Claude Code conversation
-
-You: Find the top 3 trending Python repos on GitHub
-
-Claude: I'll use Comet to browse GitHub directly.
-
-[comet_connect] → Connected to Perplexity
-[comet_mode research] → Switched to research mode
-[comet_ask "Find top 3 trending Python repos on GitHub today with their star counts"] → Task sent
-[comet_poll] → Status: WORKING, Navigating to github.com/trending...
-[comet_poll] → Status: WORKING, Filtering by Python...
-[comet_poll] → Status: COMPLETED
-
-Results:
-1. project-a - 2.3k stars today
-2. project-b - 1.8k stars today
-3. project-c - 1.2k stars today
-```
 
 ## Architecture
 
 ```
-Claude Code ←→ MCP Protocol ←→ comet-mcp ←→ Chrome DevTools Protocol ←→ Comet Browser
-                                                                              ↓
-                                                                    Perplexity AI (agentic browsing)
+Claude Code <-> MCP <-> comet-mcp <-> CDP <-> Comet Browser <-> Perplexity AI
 ```
 
 ## Requirements
 
 - Node.js 18+
 - [Perplexity Comet Browser](https://www.perplexity.ai/comet)
-- Claude Code (or any MCP-compatible client)
+- Claude Code (or any MCP client)
 
 ## Troubleshooting
 
@@ -143,14 +80,11 @@ Claude Code ←→ MCP Protocol ←→ comet-mcp ←→ Chrome DevTools Protocol
 
 **"Tools not showing in Claude"**
 - Restart Claude Code after config changes
-- Verify `~/.mcp.json` syntax
 
 ## License
 
 MIT
 
 ---
-
-**Built for the Claude Code community.**
 
 [Report Issues](https://github.com/hanzili/comet-mcp/issues) · [Contribute](https://github.com/hanzili/comet-mcp)
