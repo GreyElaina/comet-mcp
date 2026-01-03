@@ -87,6 +87,26 @@ Claude: [connects to Comet, delegates research, monitors progress, returns resul
 | `labs` | Data visualization & analytics |
 | `learn` | Educational explanations |
 
+## Prompting Tips
+
+When sending tasks to Comet via `comet_ask`, focus on **context and goals** rather than step-by-step instructions:
+
+**Good prompts:**
+```
+"I need to find the best React state management libraries for a large-scale app.
+Compare their bundle sizes, learning curves, and community support."
+
+"Help me understand how Stripe's pricing API works. I'm building a SaaS
+and need to implement usage-based billing."
+```
+
+**Less effective prompts:**
+```
+"Go to google.com, search for React state management, click the first result..."
+```
+
+Claude understands the task context; Comet handles the browsing. Let them collaborate - Comet will figure out the best way to navigate and gather information.
+
 ## Example Workflow
 
 ```
@@ -98,7 +118,7 @@ Claude: I'll use Comet to browse GitHub directly.
 
 [comet_connect] → Connected to Perplexity
 [comet_mode research] → Switched to research mode
-[comet_ask "Go to GitHub trending and find top 3 Python repos"] → Task sent
+[comet_ask "Find top 3 trending Python repos on GitHub today with their star counts"] → Task sent
 [comet_poll] → Status: WORKING, Navigating to github.com/trending...
 [comet_poll] → Status: WORKING, Filtering by Python...
 [comet_poll] → Status: COMPLETED
