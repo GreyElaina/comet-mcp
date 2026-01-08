@@ -384,6 +384,10 @@ export class CometCDPClient {
       await this.disconnect();
     }
 
+    const shouldForeground =
+      process.env.COMET_FOREGROUND === "1" ||
+      process.env.COMET_FOREGROUND === "true";
+
     const options: CDP.Options = {
       port: this.state.port,
     };
@@ -402,25 +406,35 @@ export class CometCDPClient {
       this.client.Network.enable(),
     ]);
 
-    // Set actual window size (1440x900) to ensure consistent UI
-    try {
-      // Get window ID and set bounds
-      const { windowId } = await (this.client as any).Browser.getWindowForTarget({ targetId });
-      await (this.client as any).Browser.setWindowBounds({
-        windowId,
-        bounds: { width: 1440, height: 900, windowState: 'normal' },
-      });
-    } catch (e) {
-      // Fallback to emulation if Browser API fails
+    // Avoid stealing OS focus by default. Enable foregrounding only if explicitly requested.
+    if (shouldForeground) {
       try {
-        await (this.client as any).Emulation.setDeviceMetricsOverride({
-          width: 1440,
-          height: 900,
-          deviceScaleFactor: 1,
-          mobile: false,
+        await this.client.Page.bringToFront();
+      } catch {
+        // Not fatal
+      }
+
+      // Window sizing can also be disruptive; only do it when foregrounding.
+      try {
+        const { windowId } = await (this.client as any).Browser.getWindowForTarget({
+          targetId,
+        });
+        await (this.client as any).Browser.setWindowBounds({
+          windowId,
+          bounds: { width: 1440, height: 900, windowState: "normal" },
         });
       } catch {
-        // Continue anyway
+        // Fallback to emulation if Browser API fails
+        try {
+          await (this.client as any).Emulation.setDeviceMetricsOverride({
+            width: 1440,
+            height: 900,
+            deviceScaleFactor: 1,
+            mobile: false,
+          });
+        } catch {
+          // Continue anyway
+        }
       }
     }
 

@@ -52,6 +52,11 @@ You: "Use Comet to research the top AI frameworks in 2025"
 Claude: [connects to Comet, delegates research, monitors progress, returns results]
 ```
 
+## Notes for MCPorter
+
+- `comet_ask` (and `comet_poll`, etc.) auto-starts Comet + connects via CDP if needed. `comet_connect` is optional.
+- MCPorter may start a fresh stdio process per `mcporter call` unless the server is configured as keep-alive (daemon-managed). If you want to reuse state/cookies between calls, enable the daemon and keep-alive for `comet-mcp`.
+
 ## Tools
 
 | Tool | Description |
