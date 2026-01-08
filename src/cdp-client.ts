@@ -473,7 +473,21 @@ export class CometCDPClient {
     const result = await this.client!.Page.navigate({ url });
 
     if (waitForLoad) {
-      await this.client!.Page.loadEventFired();
+      const start = Date.now();
+      // Avoid hanging forever on loadEventFired() for SPA / same-URL navigations.
+      while (Date.now() - start < 15000) {
+        try {
+          const ready = await this.client!.Runtime.evaluate({
+            expression: "document.readyState",
+            returnByValue: true,
+          });
+          const state = (ready.result.value as string) || "";
+          if (state === "complete" || state === "interactive") break;
+        } catch {
+          // Ignore transient evaluation errors during navigation
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
     }
 
     this.state.currentUrl = url;
@@ -599,6 +613,44 @@ export class CometCDPClient {
       type: "keyUp",
       key,
     });
+  }
+
+  /**
+   * Press a key with modifiers (CDP modifiers bitmask: alt=1, ctrl=2, meta=4, shift=8)
+   */
+  async pressKeyWithModifiers(
+    key: string,
+    modifiers: number,
+    options?: { code?: string; selector?: string }
+  ): Promise<void> {
+    this.ensureConnected();
+
+    if (options?.selector) {
+      await this.evaluate(`document.querySelector(${JSON.stringify(options.selector)})?.focus()`);
+    }
+
+    const code = options?.code;
+
+    await this.client!.Input.dispatchKeyEvent({
+      type: "keyDown",
+      key,
+      code,
+      modifiers,
+    } as any);
+    await this.client!.Input.dispatchKeyEvent({
+      type: "keyUp",
+      key,
+      code,
+      modifiers,
+    } as any);
+  }
+
+  /**
+   * Insert text into the currently focused element (more reliable than DOM assignment for React inputs)
+   */
+  async insertText(text: string): Promise<void> {
+    this.ensureConnected();
+    await (this.client!.Input as any).insertText({ text });
   }
 
   /**

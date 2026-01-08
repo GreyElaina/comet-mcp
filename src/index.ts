@@ -14,15 +14,45 @@ import {
 import { cometClient } from "./cdp-client.js";
 import { cometAI } from "./comet-ai.js";
 
+const chunkText = (text: string, chunkSize = 8000): string[] => {
+  if (text.length <= chunkSize) return [text];
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += chunkSize) {
+    chunks.push(text.slice(i, i + chunkSize));
+  }
+  return chunks;
+};
+
+const toTextContent = (text: string) => {
+  const chunks = chunkText(text);
+  if (chunks.length === 1) return [{ type: "text" as const, text }];
+  return chunks.map((chunk, index) => ({
+    type: "text" as const,
+    text: `[Part ${index + 1}/${chunks.length}]\n${chunk}`,
+  }));
+};
+
+const parsePositiveInt = (value: unknown): number | null => {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.trunc(n);
+};
+
 const TOOLS: Tool[] = [
   {
     name: "comet_connect",
-    description: "Connect to Comet browser (auto-starts if needed)",
+    description:
+      "Connect to Comet browser (auto-starts if needed). Optional: other tools auto-connect if needed. Warning: this may reset tabs/state (use comet_poll if a task is already running).",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "comet_ask",
-    description: `Send a prompt to Comet/Perplexity and wait for the complete response (blocking).
+    description: `Send a prompt to Comet/Perplexity and wait for the complete response (blocking). Auto-connects if needed.
+
+IMPORTANT (in-flight tasks):
+- If a previous Comet task is still running, DO NOT call comet_ask again (it will start a new prompt).
+- Use comet_poll to monitor the existing task until it completes.
+- Use comet_stop to cancel the current task if needed, then call comet_ask again.
 
 WHEN TO USE COMET vs other tools:
 - USE COMET for: tasks requiring real browser interaction (login walls, dynamic content, multi-step navigation, filling forms, clicking buttons, scraping live data from specific sites)
@@ -49,16 +79,36 @@ FORMATTING WARNING:
       type: "object",
       properties: {
         prompt: { type: "string", description: "Question or task for Comet - focus on goals and context" },
-        timeout: { type: "number", description: "Max wait time in ms (default: 300000 = 5 min)" },
+        timeout: { type: "number", description: "Max server-side wait in ms (default: 60000 = 60s). Note: your MCP client may enforce a shorter request timeout; use comet_poll if the call returns early." },
         newChat: { type: "boolean", description: "Start a fresh conversation (default: false)" },
+        force: { type: "boolean", description: "Force sending a new prompt even if Comet appears busy (default: false). Prefer comet_poll or comet_stop." },
+        maxOutputChars: { type: "number", description: "Limit returned text length (chars). If truncated, use comet_poll with offset/limit to page (default: 24000)." },
       },
       required: ["prompt"],
     },
   },
   {
     name: "comet_poll",
-    description: "Check agent status and progress. Call repeatedly to monitor agentic tasks.",
-    inputSchema: { type: "object", properties: {} },
+    description: "Check agent status and progress (does not start a new task). Call repeatedly to monitor an existing agentic task.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        offset: { type: "number", description: "Response slice start (chars). Default: 0" },
+        limit: { type: "number", description: "Response slice length (chars). Default: 24000" },
+      },
+    },
+  },
+  {
+    name: "comet_debug",
+    description: "Debug helper: shows current CDP connection state, relevant tabs, and extracted UI/status signals.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        includeTargets: { type: "boolean", description: "Include raw /json/list targets (default: false)" },
+        sliceOffset: { type: "number", description: "Response preview slice offset (default: 0)" },
+        sliceLimit: { type: "number", description: "Response preview slice limit (default: 500)" },
+      },
+    },
   },
   {
     name: "comet_stop",
@@ -84,6 +134,43 @@ FORMATTING WARNING:
       },
     },
   },
+  {
+    name: "comet_models",
+    description:
+      "List available Perplexity models (best-effort; depends on account/UI). Use openMenu=true to actively open the model selector and scrape options.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        openMenu: { type: "boolean", description: "Attempt to open model selector dropdown (default: false)" },
+        includeRaw: { type: "boolean", description: "Include debug details (default: false)" },
+      },
+    },
+  },
+  {
+    name: "comet_model",
+    description:
+      "Switch Perplexity model by name (best-effort; depends on account/UI). Use comet_models first to see available options.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Model name (case-insensitive substring match)" },
+        includeRaw: { type: "boolean", description: "Include debug details (default: false)" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "comet_temp_chat",
+    description:
+      "Inspect or toggle Perplexity temporary/private chat mode (best-effort; depends on account/UI). Call without enable to inspect.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        enable: { type: "boolean", description: "Enable/disable temporary chat mode (omit to only inspect)" },
+        includeRaw: { type: "boolean", description: "Include debug details (default: false)" },
+      },
+    },
+  },
 ];
 
 const server = new Server(
@@ -93,8 +180,73 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
+
+  const progressToken = extra?._meta?.progressToken;
+  const sendProgress = (message: string, progress: number, total?: number) => {
+    if (progressToken === undefined) return;
+    void extra.sendNotification({
+      method: "notifications/progress",
+      params: { progressToken, progress, total, message },
+    } as any).catch(() => {});
+  };
+
+  const ensureConnectedToComet = async (): Promise<string | null> => {
+    const isUsableViewport = async (): Promise<boolean> => {
+      try {
+        const metrics = await cometClient.safeEvaluate(`(() => ({ w: window.innerWidth, h: window.innerHeight }))()`);
+        const v = metrics?.result?.value as any;
+        const w = Number(v?.w ?? 0);
+        const h = Number(v?.h ?? 0);
+        return Number.isFinite(w) && Number.isFinite(h) && w >= 200 && h >= 200;
+      } catch {
+        return false;
+      }
+    };
+
+    if (cometClient.isConnected) {
+      if (await isUsableViewport()) return null;
+      // Sometimes CDP attaches to a hidden/prerendered Perplexity tab (0x0 viewport).
+      // Reconnect to a visible page target in that case.
+      try {
+        await cometClient.disconnect();
+      } catch {
+        // ignore
+      }
+    }
+
+    const startResult = await cometClient.startComet(9222);
+
+    const targets = await cometClient.listTargets();
+    const pageTabs = targets.filter((t) => t.type === "page");
+
+    // Prefer an existing Perplexity tab if present; otherwise use any visible page.
+    const candidateTabs = [
+      ...pageTabs.filter((t) => t.url.includes("perplexity.ai") && !t.url.includes("sidecar")),
+      ...pageTabs.filter((t) => t.url.includes("perplexity.ai")),
+      ...pageTabs.filter((t) => t.url !== "about:blank"),
+    ];
+
+    const seen = new Set<string>();
+    for (const tab of candidateTabs) {
+      if (!tab?.id || seen.has(tab.id)) continue;
+      seen.add(tab.id);
+      try {
+        await cometClient.connect(tab.id);
+        await new Promise((r) => setTimeout(r, 150));
+        if (await isUsableViewport()) return startResult;
+      } catch {
+        // Try the next tab
+      }
+    }
+
+    // No tabs at all - create a new one
+    const newTab = await cometClient.newTab("https://www.perplexity.ai/");
+    await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait for page load
+    await cometClient.connect(newTab.id);
+    return startResult;
+  };
 
   try {
     switch (name) {
@@ -135,9 +287,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "comet_ask": {
+        // Ensure CDP connection exists (mcporter may launch a fresh stdio process per call)
+        await ensureConnectedToComet();
+
         const prompt = args?.prompt as string;
-        const timeout = (args?.timeout as number) || 300000; // Default 5 minutes
+        const force = (args as any)?.force === true;
+        const maxOutputChars = parsePositiveInt((args as any)?.maxOutputChars) ?? 24000;
+        const timeoutRaw = (args as any)?.timeout;
+        const timeoutParsed =
+          typeof timeoutRaw === "number" ? timeoutRaw : Number(timeoutRaw);
+        const timeout =
+          Number.isFinite(timeoutParsed) && timeoutParsed > 0
+            ? timeoutParsed
+            : 60000; // Default 60 seconds (use comet_poll for long tasks)
         const newChat = (args?.newChat as boolean) || false;
+
+        // Guard: don't accidentally start a new prompt while an agentic run is in-flight.
+        const preStatus = await cometAI.getAgentStatus();
+        if (!force && preStatus.status === "working") {
+          return {
+            content: [{
+              type: "text",
+              text:
+                "Comet appears to be busy with an in-flight task.\n\n" +
+                "Use comet_poll to monitor progress, or comet_stop to cancel.\n" +
+                "If you really want to send a new prompt anyway, call comet_ask with force=true.",
+            }],
+            isError: true,
+          };
+        }
+
+        const sleep = (ms: number) =>
+          new Promise<void>((resolve) => {
+            if (extra.signal.aborted) return resolve();
+            const timer = setTimeout(resolve, ms);
+            extra.signal.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(timer);
+                resolve();
+              },
+              { once: true }
+            );
+          });
 
         // Get fresh URL from browser (not cached state)
         const urlResult = await cometClient.evaluate('window.location.href');
@@ -150,7 +342,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for page load
         }
 
+        // Ensure "隐身" (incognito/temporary) mode is enabled if available.
+        // This reduces interference with the user's normal Perplexity account history.
+        // Policy:
+        // - Force-check on newChat (or when we had to navigate back to Perplexity).
+        // - Otherwise use a short TTL cache to avoid paying UI automation cost every call.
+        try {
+          const forceCheckIncognito = newChat || !isOnPerplexity;
+          const maxAgeMs = forceCheckIncognito ? 0 : 5 * 60 * 1000;
+          sendProgress(
+            forceCheckIncognito
+              ? "Checking incognito (隐身) mode…"
+              : "Checking incognito (隐身) mode (cached)…",
+            5,
+            100
+          );
+          const res = await cometAI.ensureTemporaryChatEnabled(true, { maxAgeMs });
+          if (res.checked && res.changed) {
+            sendProgress("Enabling incognito (隐身) mode…", 8, 100);
+          }
+        } catch {
+          // Best-effort only; continue with the prompt.
+        }
+
         // Send the prompt
+        const baselineStatus = await cometAI.getAgentStatus();
+        const baselineLen = baselineStatus.latestResponseLength || baselineStatus.responseLength || 0;
+        const baselinePageUrl = baselineStatus.pageUrl || "";
+        const baselineTail =
+          baselineStatus.latestResponseTail ||
+          (baselineStatus.latestResponse || baselineStatus.response || "").slice(-4000);
+
         await cometAI.sendPrompt(prompt);
 
         // Wait for completion with polling - log progress to stderr in real-time
@@ -159,20 +381,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const seenSteps = new Set<string>();
         let lastUrl = '';
         let sawWorkingState = false;  // Track if we've seen task actually start
+        let lastResponseSignature = "";
+        let stableResponseCount = 0;
 
         const log = (msg: string) => {
           const elapsed = Math.round((Date.now() - startTime) / 1000);
           const line = `[comet ${elapsed}s] ${msg}`;
           console.error(line);  // stderr won't interfere with MCP protocol
           progressLog.push(line);
+          sendProgress(line, Date.now() - startTime, timeout);
         };
 
         log('🚀 Task started');
 
-        while (Date.now() - startTime < timeout) {
-          await new Promise(resolve => setTimeout(resolve, 2000)); // Poll every 2s
+        while (!extra.signal.aborted && Date.now() - startTime < timeout) {
+          const elapsedMs = Date.now() - startTime;
+          // Fast polling early so short queries return quickly; back off for long agent runs.
+          const pollMs = elapsedMs < 2500 ? 500 : elapsedMs < 8000 ? 1200 : 2000;
+          await sleep(pollMs);
+          if (extra.signal.aborted) break;
 
           const status = await cometAI.getAgentStatus();
+          sendProgress(
+            `Polling... ${status.status}${status.currentStep ? ` (${status.currentStep})` : ""}`,
+            Date.now() - startTime,
+            timeout
+          );
+
+          const candidateLen =
+            status.latestResponseLength || status.responseLength || 0;
+          const candidateTail =
+            status.latestResponseTail ||
+            (status.latestResponse || status.response || "").slice(-4000);
+          const responseLooksNew =
+            candidateLen > 0 &&
+            (candidateLen !== baselineLen ||
+              candidateTail !== baselineTail ||
+              (status.pageUrl && status.pageUrl !== baselinePageUrl));
+          const signature = `${candidateLen}:${candidateTail}`;
+          if (responseLooksNew) {
+            if (signature === lastResponseSignature) stableResponseCount++;
+            else stableResponseCount = 0;
+            lastResponseSignature = signature;
+          }
+
+          // Since sendPrompt() throws if it can't submit, we can safely return a completed state
+          // even if the text matches the previous response (e.g. repeating the same query).
+          if (
+            status.status === "completed" &&
+            (candidateLen > 0 || (status.latestResponse || status.response || "").length > 0) &&
+            Date.now() - startTime > 800
+          ) {
+            log("✅ Task completed");
+            const { total, slice } = await cometAI.getLatestResponseSlice(0, maxOutputChars);
+            let output =
+              slice ||
+              status.latestResponse ||
+              status.response ||
+              "Task completed (no response text extracted)";
+            if (total > maxOutputChars) {
+              output += `\n\n[TRUNCATED: returned first ${maxOutputChars}/${total} chars. Use comet_poll offset=${maxOutputChars} limit=24000 to fetch more.]`;
+            }
+            return { content: toTextContent(output) };
+          }
 
           // Log new steps we haven't seen
           for (const step of status.steps) {
@@ -188,8 +459,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             log(`🌐 ${lastUrl}`);
           }
 
-          // Track if task has actually started (working state)
-          if (status.status === 'working') {
+          // Track if task has actually started (working state).
+          // Some UI variants may not report status correctly, so treat active controls/spinners as "working".
+          if (status.status === 'working' || status.hasStopButton || status.hasLoadingSpinner) {
             if (!sawWorkingState) {
               sawWorkingState = true;
               log('⚙️ Task processing...');
@@ -199,26 +471,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
           }
 
-          // Only accept "completed" if we've seen the task actually start
-          // This prevents returning stale responses from previous queries
-          if (status.status === 'completed' && sawWorkingState) {
-            log('✅ Task completed');
-            let output = status.response || 'Task completed (no response text extracted)';
-            return { content: [{ type: "text", text: output }] };
+          // Fallback: some clients/pages never flip to "completed" reliably.
+          // If the latest response text is stable and loading has stopped, treat as complete.
+          if (
+            responseLooksNew &&
+            stableResponseCount >= 3 &&
+            !status.hasStopButton &&
+            !status.hasLoadingSpinner
+          ) {
+            log('✅ Task completed (stable response detected)');
+            const { total, slice } = await cometAI.getLatestResponseSlice(0, maxOutputChars);
+            let output = slice;
+            if (total > maxOutputChars) {
+              output += `\n\n[TRUNCATED: returned first ${maxOutputChars}/${total} chars. Use comet_poll offset=${maxOutputChars} limit=24000 to fetch more.]`;
+            }
+            return { content: toTextContent(output) };
           }
 
           // If still showing "completed" but we haven't seen "working" yet,
-          // it's the old response - wait for new task to start
+          // it's likely the old response - wait for the new task to start.
           if (status.status === 'completed' && !sawWorkingState) {
             // Check if it's been too long without seeing working state (maybe simple query)
             const elapsed = Date.now() - startTime;
-            if (elapsed > 10000) {
+            if (elapsed > 10000 && responseLooksNew) {
               // After 10s, if still showing completed, accept it
               log('✅ Task completed (quick response)');
-              let output = status.response || 'Task completed (no response text extracted)';
-              return { content: [{ type: "text", text: output }] };
+              const { total, slice } = await cometAI.getLatestResponseSlice(0, maxOutputChars);
+              let output = slice || status.latestResponse || status.response || 'Task completed (no response text extracted)';
+              if (total > maxOutputChars) {
+                output += `\n\n[TRUNCATED: returned first ${maxOutputChars}/${total} chars. Use comet_poll offset=${maxOutputChars} limit=24000 to fetch more.]`;
+              }
+              return { content: toTextContent(output) };
             }
           }
+        }
+
+        if (extra.signal.aborted) {
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          log("🛑 Request cancelled by client");
+          return {
+            content: [{
+              type: "text",
+              text: `Request was cancelled after ${elapsed}s (client-side timeout/cancel).\n\nThe Comet agent may still be working.\nUse comet_poll to check status and retrieve the result.`,
+            }],
+            isError: true,
+          };
         }
 
         // Timeout
@@ -231,7 +528,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "comet_temp_chat": {
+        await ensureConnectedToComet();
+        const enable = (args as any)?.enable;
+        const includeRaw = (args as any)?.includeRaw === true;
+
+        if (typeof enable !== "boolean") {
+          const info = await cometAI.inspectTemporaryChat({ includeRaw });
+          const lines = [
+            `Detected: ${info.detected ? "yes" : "no"}`,
+            `Enabled: ${info.enabled === null ? "(unknown)" : info.enabled ? "yes" : "no"}`,
+          ];
+          if (includeRaw && info.debug) {
+            lines.push("", "--- Debug ---", JSON.stringify(info.debug, null, 2));
+          }
+          return { content: [{ type: "text", text: lines.join("\n") }] };
+        }
+
+        const res = await cometAI.setTemporaryChatEnabled(enable, { includeRaw });
+        const lines = [
+          `Requested: ${enable ? "enable" : "disable"}`,
+          `Attempted: ${res.attempted ? "yes" : "no"}`,
+          `Changed: ${res.changed ? "yes" : "no"}`,
+          `Before: ${res.before.enabled === null ? "(unknown)" : res.before.enabled ? "enabled" : "disabled"}`,
+          `After: ${res.after.enabled === null ? "(unknown)" : res.after.enabled ? "enabled" : "disabled"}`,
+        ];
+        if (includeRaw && res.debug) {
+          lines.push("", "--- Debug ---", JSON.stringify(res.debug, null, 2));
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
       case "comet_poll": {
+        await ensureConnectedToComet();
+        const offsetRaw = (args as any)?.offset;
+        const offset = (Number.isFinite(Number(offsetRaw)) && Number(offsetRaw) >= 0)
+          ? Math.trunc(Number(offsetRaw))
+          : 0;
+        const limit = parsePositiveInt((args as any)?.limit) ?? 24000;
         const status = await cometAI.getAgentStatus();
         let output = `Status: ${status.status.toUpperCase()}\n`;
 
@@ -247,8 +581,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           output += `\nCurrent: ${status.currentStep}\n`;
         }
 
-        if (status.status === 'completed' && status.response) {
-          output += `\n--- Response ---\n${status.response}\n`;
+        if (status.status === 'completed') {
+          const { total, slice } = await cometAI.getLatestResponseSlice(offset, limit);
+          if (slice) {
+            const start = Math.min(offset, total);
+            const end = Math.min(start + limit, total);
+            const more = end < total;
+            const header =
+              `${output}\n--- Response ---\n` +
+              `[Slice ${start}-${end} of ${total} chars${more ? `; next offset=${end}` : ""}]\n`;
+            return { content: [{ type: "text", text: header }, ...toTextContent(slice)] };
+          }
         } else if (status.status === 'working' && status.hasStopButton) {
           output += `\n[Agent is working - use comet_stop to interrupt if needed]`;
         }
@@ -257,6 +600,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "comet_stop": {
+        await ensureConnectedToComet();
         const stopped = await cometAI.stopAgent();
         return {
           content: [{
@@ -267,6 +611,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "comet_screenshot": {
+        await ensureConnectedToComet();
         const result = await cometClient.screenshot("png");
         return {
           content: [{ type: "image", data: result.data, mimeType: "image/png" }],
@@ -274,6 +619,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "comet_mode": {
+        await ensureConnectedToComet();
         const mode = args?.mode as string | undefined;
 
         // If no mode provided, show current mode
@@ -400,6 +746,82 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             isError: true,
           };
         }
+      }
+
+      case "comet_models": {
+        await ensureConnectedToComet();
+        const openMenu = (args as any)?.openMenu === true;
+        const includeRaw = (args as any)?.includeRaw === true;
+
+        const info = await cometAI.getModelInfo({ openMenu, includeRaw });
+        const lines = [
+          `Current model: ${info.currentModel ?? "(unknown)"}`,
+          `Supports switching: ${info.supportsModelSwitching ? "yes" : "no"}`,
+          "",
+          "Available models:",
+          ...(info.availableModels.length
+            ? info.availableModels.map((m) => `- ${m}`)
+            : ["- (none detected)"]),
+        ];
+
+        if (includeRaw && info.debug) {
+          lines.push("", "--- Debug ---", JSON.stringify(info.debug, null, 2));
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
+      case "comet_model": {
+        await ensureConnectedToComet();
+        const name = String((args as any)?.name ?? "");
+        const includeRaw = (args as any)?.includeRaw === true;
+
+        const res = await cometAI.setModel(name);
+        const lines = [
+          `Requested: ${name}`,
+          `Changed: ${res.changed ? "yes" : "no"}`,
+          `Current model: ${res.currentModel ?? "(unknown)"}`,
+          "",
+          "Available models (best-effort):",
+          ...(res.availableModels.length
+            ? res.availableModels.map((m) => `- ${m}`)
+            : ["- (none detected)"]),
+        ];
+
+        if (includeRaw && res.debug) {
+          lines.push("", "--- Debug ---", JSON.stringify(res.debug, null, 2));
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
+      case "comet_debug": {
+        await ensureConnectedToComet();
+        const includeTargets = (args as any)?.includeTargets === true;
+        const sliceOffsetRaw = (args as any)?.sliceOffset;
+        const sliceOffset =
+          Number.isFinite(Number(sliceOffsetRaw)) && Number(sliceOffsetRaw) >= 0
+            ? Math.trunc(Number(sliceOffsetRaw))
+            : 0;
+        const sliceLimit = parsePositiveInt((args as any)?.sliceLimit) ?? 500;
+
+        const state = cometClient.currentState;
+        const status = await cometAI.getAgentStatus();
+        const iface = await cometAI.inspectInterface();
+        const tabs = await cometClient.listTabsCategorized().catch(() => null);
+        const targets = includeTargets ? await cometClient.listTargets().catch(() => []) : undefined;
+        const responsePreview = await cometAI.getLatestResponseSlice(sliceOffset, sliceLimit);
+
+        const debug = {
+          state,
+          tabs,
+          interface: iface,
+          status,
+          responsePreview: { offset: sliceOffset, limit: sliceLimit, ...responsePreview },
+          targets,
+        };
+
+        return { content: [{ type: "text", text: JSON.stringify(debug, null, 2) }] };
       }
 
       default:
