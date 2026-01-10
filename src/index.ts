@@ -223,6 +223,7 @@ FORMATTING WARNING:
         agentPolicy: { type: "string", enum: ["exit", "continue"], description: "Behavior when in agent mode (browsing a website): 'exit' (default) exits agent mode and returns to search, 'continue' sends prompt to sidecar to continue browsing." },
         reasoning: { type: "boolean", description: "Enable/disable reasoning mode (带着推理). Only available in search mode with certain models." },
         attachments: { type: "array", items: { type: "string" }, description: "File paths or file:// URIs to attach (supports: png, jpg, gif, webp, pdf, txt, csv, md). Max 25MB per file." },
+        blocking: { type: "boolean", description: "If true (default), wait until completion or timeout. If false, return early with 'in progress' status after 15s - use comet_poll to get result later." },
       },
       required: ["prompt"],
     },
@@ -462,6 +463,8 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         const mode = (args as any)?.mode as string | undefined;
         const agentPolicy = ((args as any)?.agentPolicy as string) || "exit";
         const reasoning = (args as any)?.reasoning as boolean | undefined;
+        const blocking = (args as any)?.blocking !== false;
+        const effectiveTimeout = blocking ? timeout : Math.min(timeout, 15000);
 
         // Guard: don't accidentally start a new prompt while an agentic run is in-flight.
         const preStatus = await cometAI.getAgentStatus();
@@ -652,7 +655,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
         log('🚀 Task started');
 
-        while (!extra.signal.aborted && Date.now() - startTime < timeout) {
+        while (!extra.signal.aborted && Date.now() - startTime < effectiveTimeout) {
           const elapsedMs = Date.now() - startTime;
           // Fast polling early so short queries return quickly; back off for long agent runs.
           const pollMs = elapsedMs < 2500 ? 500 : elapsedMs < 8000 ? 1200 : 2000;
@@ -663,7 +666,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
           sendProgress(
             `Polling... ${status.status}${status.currentStep ? ` (${status.currentStep})` : ""}`,
             Date.now() - startTime,
-            timeout
+            effectiveTimeout
           );
 
           const candidateLen =
@@ -777,14 +780,24 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
           };
         }
 
-        // Timeout
-        log('⏰ Timeout');
-        return {
-          content: [{
-            type: "text",
-            text: `Timeout after ${timeout/1000}s.\n\nProgress:\n${progressLog.join('\n')}\n\nUse comet_poll to check if still working.`,
-          }],
-        };
+        // Timeout or non-blocking early return
+        if (blocking) {
+          log('⏰ Timeout');
+          return {
+            content: [{
+              type: "text",
+              text: `Timeout after ${effectiveTimeout/1000}s.\n\nProgress:\n${progressLog.join('\n')}\n\nUse comet_poll to check if still working.`,
+            }],
+          };
+        } else {
+          log('⏳ Task in progress (non-blocking)');
+          return {
+            content: [{
+              type: "text",
+              text: `Task in progress (non-blocking mode).\n\nProgress:\n${progressLog.join('\n')}\n\nUse comet_poll to monitor and get the result when done.`,
+            }],
+          };
+        }
       }
 
       case "comet_poll": {

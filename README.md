@@ -87,6 +87,7 @@ The MCP server auto-launches Comet with remote debugging when needed.
 | `timeout` | number | `60000` | Max wait time in ms |
 | `maxOutputChars` | number | `24000` | Truncate response length |
 | `force` | boolean | `false` | Send even if Comet appears busy |
+| `blocking` | boolean | `true` | If `false`, return early after 15s with "in progress" |
 
 ### Agent Mode & `agentPolicy`
 
