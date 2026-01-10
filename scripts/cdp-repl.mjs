@@ -1,67 +1,65 @@
 #!/usr/bin/env node
-/**
- * Interactive CDP REPL for Comet browser debugging
- * 
- * Usage:
- *   node scripts/cdp-repl.mjs
- *   COMET_PORT=9333 node scripts/cdp-repl.mjs
- * 
- * Commands in REPL:
- *   await eval('document.title')
- *   await screenshot()
- *   await listTargets()
- *   await setFiles(['input[type="file"]', ['/path/to/file.png']])
- *   await click('button[aria-label="Attach"]')
- *   await html('body')
- */
 
-import CDP from 'chrome-remote-interface';
-import { writeFileSync, statSync } from 'fs';
+import puppeteer from 'puppeteer-core';
+import { writeFileSync } from 'fs';
 import { spawn } from 'child_process';
 
 const PORT = parseInt(process.env.COMET_PORT || '9222', 10);
 const COMET_PATH = '/Applications/Comet.app/Contents/MacOS/Comet';
 
-let client = null;
-let DOM = null;
-let Runtime = null;
-let Page = null;
-let Input = null;
+let browser = null;
+let session = null;
+let currentTargetId = null;
 
-// ============== Core Functions ==============
-
-async function connect(targetId) {
-  if (client) {
-    try { await client.close(); } catch {}
-  }
-  
-  const options = { port: PORT };
-  if (targetId) options.target = targetId;
-  
-  client = await CDP(options);
-  DOM = client.DOM;
-  Runtime = client.Runtime;
-  Page = client.Page;
-  Input = client.Input;
-  
-  await Promise.all([
-    Page.enable(),
-    Runtime.enable(),
-    DOM.enable(),
-  ]);
-  
-  const { result } = await Runtime.evaluate({ expression: 'window.location.href' });
-  console.log(`Connected to: ${result.value}`);
-  return result.value;
+async function getVersion() {
+  const resp = await fetch(`http://localhost:${PORT}/json/version`);
+  return resp.json();
 }
 
 async function listTargets() {
   const resp = await fetch(`http://localhost:${PORT}/json/list`);
   const targets = await resp.json();
   targets.forEach((t, i) => {
-    console.log(`[${i}] ${t.type} | ${t.title.slice(0, 40)} | ${t.url.slice(0, 60)}`);
+    const marker = t.id === currentTargetId ? '→' : ' ';
+    console.log(`${marker}[${i}] ${t.type} | ${t.title.slice(0, 40)} | ${t.url.slice(0, 60)}`);
   });
   return targets;
+}
+
+async function connectBrowser() {
+  if (browser?.connected) return;
+  
+  const version = await getVersion();
+  browser = await puppeteer.connect({
+    browserWSEndpoint: version.webSocketDebuggerUrl,
+    defaultViewport: null,
+  });
+  console.log('Browser connected');
+}
+
+async function connect(targetId) {
+  await connectBrowser();
+  
+  if (!targetId) {
+    const targets = await listTargets();
+    const page = targets.find(t => t.type === 'page' && t.url.includes('perplexity'));
+    targetId = page?.id || targets.find(t => t.type === 'page')?.id;
+  }
+  
+  if (!targetId) throw new Error('No page target found');
+  
+  const target = await browser.waitForTarget(t => {
+    const cdpTarget = t._getTargetInfo?.() || {};
+    return cdpTarget.targetId === targetId;
+  }, { timeout: 5000 });
+  
+  const page = await target.asPage();
+  session = await page.createCDPSession();
+  currentTargetId = targetId;
+  
+  const url = await page.url();
+  console.log(`Connected to: ${url}`);
+  return url;
 }
 
 async function connectTo(index) {
@@ -71,36 +69,35 @@ async function connectTo(index) {
   return connect(target.id);
 }
 
-// ============== Evaluation ==============
-
-async function eval_(expr) {
-  const { result, exceptionDetails } = await Runtime.evaluate({
+async function e(expr) {
+  if (!session) throw new Error('Not connected. Run: await connect()');
+  
+  const { result, exceptionDetails } = await session.send('Runtime.evaluate', {
     expression: expr,
     awaitPromise: true,
     returnByValue: true,
   });
+  
   if (exceptionDetails) {
     throw new Error(exceptionDetails.text + (exceptionDetails.exception?.description || ''));
   }
   return result.value;
 }
 
-// ============== DOM Operations ==============
-
 async function html(selector) {
-  const result = await eval_(`document.querySelector('${selector}')?.outerHTML?.slice(0, 2000) || 'not found'`);
+  const result = await e(`document.querySelector('${selector}')?.outerHTML?.slice(0, 3000) || 'not found'`);
   console.log(result);
   return result;
 }
 
 async function text(selector) {
-  const result = await eval_(`document.querySelector('${selector}')?.innerText?.slice(0, 2000) || 'not found'`);
+  const result = await e(`document.querySelector('${selector}')?.innerText?.slice(0, 2000) || 'not found'`);
   console.log(result);
   return result;
 }
 
 async function click(selector) {
-  const result = await eval_(`
+  const result = await e(`
     (() => {
       const el = document.querySelector('${selector}');
       if (!el) return { ok: false, reason: 'not found' };
@@ -113,7 +110,7 @@ async function click(selector) {
 }
 
 async function queryAll(selector) {
-  const result = await eval_(`
+  const result = await e(`
     Array.from(document.querySelectorAll('${selector}')).map((el, i) => ({
       i,
       tag: el.tagName,
@@ -128,48 +125,35 @@ async function queryAll(selector) {
   return result;
 }
 
-// ============== File Upload ==============
-
-async function getBackendNodeId(selector) {
-  const doc = await DOM.getDocument();
-  const { nodeId } = await DOM.querySelector({
-    nodeId: doc.root.nodeId,
-    selector,
-  });
-  if (!nodeId) return null;
+async function screenshot(filename = 'debug-screenshot.png') {
+  if (!session) throw new Error('Not connected');
   
-  const { node } = await DOM.describeNode({ nodeId });
-  return node.backendNodeId;
+  const { data } = await session.send('Page.captureScreenshot', { format: 'png' });
+  writeFileSync(filename, Buffer.from(data, 'base64'));
+  console.log(`Screenshot saved: ${filename}`);
+  return filename;
 }
 
 async function setFiles(selector, filePaths) {
-  // Validate files exist
-  for (const f of filePaths) {
-    try {
-      statSync(f);
-    } catch {
-      throw new Error(`File not found: ${f}`);
-    }
-  }
+  if (!session) throw new Error('Not connected');
   
-  const backendNodeId = await getBackendNodeId(selector);
-  if (!backendNodeId) {
-    throw new Error(`Element not found: ${selector}`);
-  }
+  const { root } = await session.send('DOM.getDocument');
+  const { nodeId } = await session.send('DOM.querySelector', { nodeId: root.nodeId, selector });
+  if (!nodeId) throw new Error(`Element not found: ${selector}`);
   
-  console.log(`Setting files on backendNodeId=${backendNodeId}:`, filePaths);
+  const { node } = await session.send('DOM.describeNode', { nodeId });
   
-  await DOM.setFileInputFiles({
+  await session.send('DOM.setFileInputFiles', {
     files: filePaths,
-    backendNodeId,
+    backendNodeId: node.backendNodeId,
   });
   
-  console.log('Files set successfully');
+  console.log('Files set:', filePaths);
   return true;
 }
 
 async function findFileInputs() {
-  const result = await eval_(`
+  const result = await e(`
     Array.from(document.querySelectorAll('input[type="file"]')).map((el, i) => ({
       i,
       id: el.id || null,
@@ -177,99 +161,131 @@ async function findFileInputs() {
       accept: el.accept || null,
       multiple: el.multiple,
       visible: el.offsetParent !== null,
-      parent: el.parentElement?.tagName || null,
     }))
   `);
   console.table(result);
   return result;
 }
 
-// ============== Screenshot ==============
-
-async function screenshot(filename = 'debug-screenshot.png') {
-  const { data } = await Page.captureScreenshot({ format: 'png' });
-  writeFileSync(filename, Buffer.from(data, 'base64'));
-  console.log(`Screenshot saved: ${filename}`);
-  return filename;
+async function getCurrentMode() {
+  const result = await e(`
+    (() => {
+      const radio = document.querySelector('button[role="radio"][aria-checked="true"]');
+      return radio ? radio.getAttribute('value') : null;
+    })()
+  `);
+  console.log('Current mode:', result);
+  return result;
 }
 
-// ============== Perplexity Specific ==============
-
-async function findAttachButton() {
-  const result = await eval_(`
+async function findModelSelector() {
+  const result = await e(`
     (() => {
-      const selectors = [
-        'button[aria-label*="Attach"]',
-        'button[aria-label*="attach"]',
-        'button[aria-label*="Upload"]',
-        'button[aria-label*="upload"]',
-        'button[aria-label*="Add file"]',
-        'button[aria-label*="添加"]',
-        'button[aria-label*="附件"]',
-      ];
+      const cpuButtons = Array.from(document.querySelectorAll('use'))
+        .filter(u => u.getAttribute('xlink:href')?.includes('cpu'))
+        .map(u => u.closest('button'))
+        .filter(Boolean);
       
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el && el.offsetParent !== null) {
-          return { found: true, selector: sel, aria: el.getAttribute('aria-label'), text: (el.innerText || '').slice(0, 30) };
-        }
+      return cpuButtons.map(btn => {
+        const rect = btn.getBoundingClientRect();
+        return {
+          tag: btn.tagName,
+          aria: btn.getAttribute('aria-label') || '',
+          haspopup: btn.getAttribute('aria-haspopup'),
+          rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+        };
+      });
+    })()
+  `);
+  console.table(result);
+  return result;
+}
+
+async function clickModelSelector() {
+  const result = await e(`
+    (() => {
+      const cpuUse = Array.from(document.querySelectorAll('use')).find(u => 
+        u.getAttribute('xlink:href')?.includes('cpu') && 
+        u.closest('button')?.getAttribute('aria-haspopup') !== 'dialog'
+      );
+      const btn = cpuUse?.closest('button');
+      if (btn) {
+        btn.click();
+        return { clicked: true, aria: btn.getAttribute('aria-label') };
       }
-      
-      // Fallback: find buttons with + icon near input
-      const inputArea = document.querySelector('[contenteditable="true"]')?.closest('form') 
-                     || document.querySelector('textarea')?.closest('form');
-      if (inputArea) {
-        const buttons = inputArea.querySelectorAll('button');
-        for (const btn of buttons) {
-          const aria = btn.getAttribute('aria-label') || '';
-          const text = btn.innerText || '';
-          if (btn.querySelector('svg') && !aria.toLowerCase().includes('submit') && !aria.toLowerCase().includes('send')) {
-            return { found: true, selector: 'form button (heuristic)', aria, text: text.slice(0, 30) };
-          }
-        }
-      }
-      
-      return { found: false };
+      return { clicked: false };
     })()
   `);
   console.log(result);
   return result;
 }
 
-async function inspectUploadUI() {
-  console.log('\n=== File Inputs ===');
-  await findFileInputs();
-  
-  console.log('\n=== Attach Button ===');
-  await findAttachButton();
-  
-  console.log('\n=== Buttons near input ===');
-  await eval_(`
+async function listMenuItems() {
+  const result = await e(`
     (() => {
-      const input = document.querySelector('[contenteditable="true"]') || document.querySelector('textarea');
-      if (!input) return [];
-      let parent = input.parentElement;
-      for (let i = 0; i < 5 && parent; i++) {
-        const buttons = parent.querySelectorAll('button');
-        if (buttons.length > 0) {
-          return Array.from(buttons).map(b => ({
-            aria: b.getAttribute('aria-label') || null,
-            text: (b.innerText || '').slice(0, 20),
-            hasSvg: !!b.querySelector('svg'),
-            disabled: b.disabled,
-          }));
+      const selectors = [
+        '[role="menu"] [role="menuitem"]',
+        '.shadow-overlay [role="menuitem"]',
+        'div[style*="position: fixed"] [role="menuitem"]',
+        '[role="menuitem"]',
+        '[role="listbox"] [role="option"]',
+        '[role="menu"] button',
+        '[role="menu"] div[tabindex]',
+      ];
+      
+      let items = [];
+      for (const sel of selectors) {
+        const found = document.querySelectorAll(sel);
+        if (found.length > 0) {
+          items = Array.from(found);
+          break;
         }
-        parent = parent.parentElement;
       }
-      return [];
+      
+      return items.map((el, i) => {
+        const rect = el.getBoundingClientRect();
+        const visible = rect.width > 0 && rect.height > 0;
+        const text = (el.innerText || '').split('\\n')[0].trim().slice(0, 50);
+        return {
+          i,
+          text,
+          role: el.getAttribute('role'),
+          aria: (el.getAttribute('aria-label') || '').slice(0, 30),
+          visible,
+          rect: visible ? { x: Math.round(rect.x), y: Math.round(rect.y) } : null,
+        };
+      }).filter(x => x.visible);
     })()
-  `).then(r => console.table(r));
+  `);
+  console.table(result);
+  return result;
 }
 
-// ============== Start Comet ==============
+async function inspectModelMenu() {
+  console.log('\n=== Model Selector Candidates ===');
+  await findModelSelector();
+  
+  console.log('\n=== Clicking Model Selector ===');
+  await clickModelSelector();
+  
+  await new Promise(r => setTimeout(r, 500));
+  
+  console.log('\n=== Menu Items ===');
+  await listMenuItems();
+  
+  console.log('\n=== All visible menus ===');
+  const menus = await e(`
+    Array.from(document.querySelectorAll('[role="menu"], [role="listbox"], .shadow-overlay')).map(el => ({
+      role: el.getAttribute('role'),
+      class: (el.className || '').slice(0, 50),
+      children: el.children.length,
+      visible: el.getBoundingClientRect().width > 0,
+    }))
+  `);
+  console.table(menus);
+}
 
 async function startComet() {
-  // Check if already running
   try {
     const resp = await fetch(`http://localhost:${PORT}/json/version`);
     if (resp.ok) {
@@ -285,7 +301,6 @@ async function startComet() {
   });
   proc.unref();
   
-  // Wait for it
   for (let i = 0; i < 30; i++) {
     await new Promise(r => setTimeout(r, 500));
     try {
@@ -299,53 +314,55 @@ async function startComet() {
   throw new Error('Timeout starting Comet');
 }
 
-// ============== REPL ==============
-
 async function startREPL() {
-  // Export to global for REPL access
   global.connect = connect;
   global.listTargets = listTargets;
   global.connectTo = connectTo;
-  global.e = eval_;           // e('document.title')
-  global.js = eval_;          // js('document.title') - alias
+  global.e = e;
+  global.js = e;
   global.html = html;
   global.text = text;
   global.click = click;
   global.queryAll = queryAll;
   global.setFiles = setFiles;
   global.findFileInputs = findFileInputs;
-  global.getBackendNodeId = getBackendNodeId;
   global.screenshot = screenshot;
-  global.findAttachButton = findAttachButton;
-  global.inspectUploadUI = inspectUploadUI;
   global.startComet = startComet;
+  global.getCurrentMode = getCurrentMode;
+  global.findModelSelector = findModelSelector;
+  global.clickModelSelector = clickModelSelector;
+  global.listMenuItems = listMenuItems;
+  global.inspectModelMenu = inspectModelMenu;
   
   console.log(`
 ╔═══════════════════════════════════════════════════════════╗
-║           CDP REPL for Comet Browser Debugging            ║
+║        CDP REPL for Comet (puppeteer-core)                ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  await startComet()       - Start Comet if not running    ║
 ║  await listTargets()      - List all browser tabs         ║
-║  await connect()          - Connect to first tab          ║
+║  await connect()          - Connect to Perplexity tab     ║
 ║  await connectTo(0)       - Connect to tab by index       ║
 ║                                                           ║
 ║  await e('...')           - Evaluate JS in page           ║
-║  await js('...')          - Alias for e()                 ║
 ║  await html('selector')   - Get element HTML              ║
 ║  await text('selector')   - Get element text              ║
 ║  await click('selector')  - Click element                 ║
 ║  await queryAll('sel')    - List all matching elements    ║
 ║  await screenshot()       - Save screenshot               ║
 ║                                                           ║
+║  === Model Selector ===                                   ║
+║  await getCurrentMode()      - Get current mode           ║
+║  await findModelSelector()   - Find model selector btn    ║
+║  await clickModelSelector()  - Click to open model menu   ║
+║  await listMenuItems()       - List visible menu items    ║
+║  await inspectModelMenu()    - Full model menu inspection ║
+║                                                           ║
 ║  === File Upload ===                                      ║
 ║  await findFileInputs()   - Find all file inputs          ║
-║  await findAttachButton() - Find Perplexity attach btn    ║
-║  await inspectUploadUI()  - Full upload UI inspection     ║
 ║  await setFiles('input[type="file"]', ['/path/file.png']) ║
 ╚═══════════════════════════════════════════════════════════╝
 `);
 
-  // Start Node REPL
   const repl = await import('repl');
   const r = repl.start({
     prompt: 'cdp> ',
@@ -353,10 +370,9 @@ async function startREPL() {
   });
   
   r.on('exit', () => {
-    if (client) client.close().catch(() => {});
+    if (browser) browser.disconnect();
     process.exit(0);
   });
 }
 
-// Auto-start
 startREPL().catch(console.error);
