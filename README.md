@@ -1,6 +1,7 @@
 # comet-mcp
 
 [![npm version](https://img.shields.io/npm/v/comet-mcp.svg)](https://www.npmjs.com/package/comet-mcp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 <a href="https://glama.ai/mcp/servers/@hanzili/comet-mcp">
   <img width="380" height="200" src="https://glama.ai/mcp/servers/@hanzili/comet-mcp/badge" />
@@ -8,30 +9,34 @@
 
 **Give Claude Code a browser that thinks.**
 
-An MCP server that connects Claude Code to [Perplexity Comet](https://www.perplexity.ai/comet) - enabling agentic web browsing, deep research, and real-time task monitoring.
+An MCP server that connects Claude Code to [Perplexity Comet](https://www.perplexity.ai/comet) — enabling agentic web browsing, deep research, and real-time task monitoring.
 
 ![Demo](demo.gif)
 
-## Why?
+## Why comet-mcp?
 
-Existing web tools for Claude Code fall short:
-- **WebSearch/WebFetch** only return static text - no interaction, no login, no dynamic content
-- **Browser automation MCPs** (like browser-use) are agentic but use a generic LLM to control a browser - less polished, more fragile
+| Approach | Limitation |
+|----------|------------|
+| **WebSearch/WebFetch** | Static text only — no interaction, no login, no dynamic content |
+| **Browser automation MCPs** | Generic LLM controlling browser — less polished, more fragile |
+| **Comet + comet-mcp** | Perplexity's native agentic browser — purpose-built for web research, battle-tested |
 
-**Comet is Perplexity's native agentic browser** - their AI is purpose-built for web research, deeply integrated with search, and battle-tested. Give it a goal, it figures out how to get there.
-
-**comet-mcp** bridges Claude Code and Comet: Claude's coding intelligence + Perplexity's web intelligence.
+**comet-mcp** = Claude's coding intelligence + Perplexity's web intelligence.
 
 ## Quick Start
 
-### 1. Configure Claude Code
+### 1. Install Comet Browser
+
+Download [Perplexity Comet](https://www.perplexity.ai/comet) and install it.
+
+### 2. Configure Your MCP Client
 
 Add to `~/.claude.json` or `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "comet-bridge": {
+    "comet": {
       "command": "npx",
       "args": ["-y", "comet-mcp"]
     }
@@ -39,40 +44,63 @@ Add to `~/.claude.json` or `.mcp.json`:
 }
 ```
 
-### 2. Install Comet Browser
-
-Download and install [Perplexity Comet](https://www.perplexity.ai/comet).
-
-That's it! The MCP server will automatically launch Comet with remote debugging enabled when needed. If Comet is already running, it will restart it with the correct flags.
-
-### 3. Use in Claude Code
+### 3. Use It
 
 ```
-You: "Use Comet to research the top AI frameworks in 2025"
+You: "Use Comet to research the latest React 19 features"
 Claude: [connects to Comet, delegates research, monitors progress, returns results]
 ```
 
-## Notes for MCPorter
-
-- `comet_ask` (and `comet_poll`, etc.) auto-starts Comet + connects via CDP if needed. `comet_connect` is optional.
-- MCPorter may start a fresh stdio process per `mcporter call` unless the server is configured as keep-alive (daemon-managed). If you want to reuse state/cookies between calls, enable the daemon and keep-alive for `comet-mcp`.
+The MCP server auto-launches Comet with remote debugging when needed.
 
 ## Tools
 
+### Core
+
 | Tool | Description |
 |------|-------------|
-| `comet_connect` | Connect to Comet (auto-starts if needed) |
-| `comet_ask` | Send a task and wait for response. Params: `mode`, `tempChat` (default: true), `reasoning`, `attachments` |
-| `comet_poll` | Check task progress. Use `includeSettings` to show current mode/tempChat/model/reasoning |
+| `comet_ask` | Send a prompt and wait for response |
+| `comet_poll` | Check task progress (for long-running tasks) |
+| `comet_stop` | Cancel current task |
+| `comet_connect` | Explicitly connect to Comet (usually auto) |
+
+### Utilities
+
+| Tool | Description |
+|------|-------------|
+| `comet_screenshot` | Capture current page as MCP resource |
+| `comet_list_models` | List available Perplexity models |
+| `comet_set_model` | Switch Perplexity model |
 | `comet_debug` | Dump CDP/UI status for debugging |
-| `comet_stop` | Stop current task |
-| `comet_screenshot` | Capture current page (saves as a resource) |
-| `comet_list_models` | List available Perplexity models (best-effort) |
-| `comet_set_model` | Switch Perplexity model by name (best-effort) |
 
-### File attachments
+## `comet_ask` Parameters
 
-`comet_ask` supports attaching files (images, PDFs, etc.) for Perplexity to analyze:
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prompt` | string | *required* | Question or task for Comet |
+| `mode` | string | current | `search`, `research`, `labs`, or `learn` |
+| `newChat` | boolean | `false` | Start a fresh conversation |
+| `tempChat` | boolean | `true` | Enable Perplexity incognito mode |
+| `agentPolicy` | string | `exit` | When browsing a website: `exit` returns to search, `continue` keeps browsing |
+| `reasoning` | boolean | - | Enable/disable reasoning mode |
+| `attachments` | string[] | - | File paths to attach (images, PDFs, etc.) |
+| `timeout` | number | `60000` | Max wait time in ms |
+| `maxOutputChars` | number | `24000` | Truncate response length |
+| `force` | boolean | `false` | Send even if Comet appears busy |
+
+### Agent Mode & `agentPolicy`
+
+When Comet is actively browsing a website (agent mode), you can control behavior:
+
+```jsonc
+// Default: exit agent mode, return to normal search
+{ "prompt": "What is 2+2?" }
+
+// Continue browsing the current page
+{ "prompt": "Now click the submit button", "agentPolicy": "continue" }
+```
+
+### File Attachments
 
 ```json
 {
@@ -81,28 +109,26 @@ Claude: [connects to Comet, delegates research, monitors progress, returns resul
 }
 ```
 
-- Accepts local file paths or `file://` URIs
-- Supported formats: png, jpg, jpeg, gif, webp, pdf, txt, csv, md
-- Max file size: 25MB per file
-- Multiple files can be attached in a single request
+Supported: `png`, `jpg`, `gif`, `webp`, `pdf`, `txt`, `csv`, `md` (max 25MB each)
 
-### Screenshots & resources
+## Screenshots & Resources
 
-`comet_screenshot` no longer dumps base64 blobs into the tool response. Instead it writes the PNG to your OS temp directory (e.g. `/tmp/comet-mcp/screenshots`) and returns a `resource_link` pointing at `comet://screenshots/<filename>`. Use the standard MCP resource APIs to retrieve the data:
+`comet_screenshot` saves to temp directory and returns an MCP resource link:
 
-- `resources/list` shows every retained screenshot, newest first.
-- `resources/read` downloads the referenced file with the correct MIME type.
+```
+comet://screenshots/<filename>.png
+```
 
-Older screenshots are pruned automatically. By default we keep 20 files for up to 30 minutes; override via `COMET_SCREENSHOT_MAX` (count) and `COMET_SCREENSHOT_TTL_MS` (milliseconds) if you need longer retention.
+Use `resources/list` and `resources/read` to access. Auto-pruned after 30 minutes (configurable).
 
-### Environment variables
+## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `COMET_PORT` | `9222` | CDP debug port (change if 9222 conflicts with other Chrome debuggers) |
-| `COMET_FOREGROUND` | unset | Set to `1` to bring Comet window to front on connect |
-| `COMET_SCREENSHOT_MAX` | `20` | Maximum screenshots to retain |
-| `COMET_SCREENSHOT_TTL_MS` | `1800000` | Screenshot retention time (30 min) |
+| `COMET_PORT` | `9222` | CDP debug port |
+| `COMET_FOREGROUND` | unset | Set `1` to bring Comet to front |
+| `COMET_SCREENSHOT_MAX` | `20` | Max screenshots retained |
+| `COMET_SCREENSHOT_TTL_MS` | `1800000` | Screenshot retention (30 min) |
 
 ## Architecture
 
@@ -113,43 +139,50 @@ Claude Code <-> MCP <-> comet-mcp <-> CDP <-> Comet Browser <-> Perplexity AI
 ## Requirements
 
 - Node.js 18+
-- [Perplexity Comet Browser](https://www.perplexity.ai/comet)
-- Claude Code (or any MCP client)
+- [Perplexity Comet](https://www.perplexity.ai/comet) (macOS)
+- Claude Code or any MCP client
 
 ## Troubleshooting
 
-**"Cannot connect to Comet"**
-- Make sure Comet is installed at `/Applications/Comet.app`
-- Check if the debug port is available (default 9222, configurable via `COMET_PORT` env var)
-- If port 9222 conflicts with another Chrome debugger, set `COMET_PORT=9333` (or any free port)
+<details>
+<summary><strong>Cannot connect to Comet</strong></summary>
 
-**"Comet keeps popping to the front / steals my keyboard focus"**
-- Newer versions avoid foregrounding by default. Set `COMET_FOREGROUND=1` only if you explicitly want the tab/window to be brought to front.
+- Ensure Comet is installed at `/Applications/Comet.app`
+- Check port availability: `lsof -i :9222`
+- Try different port: `COMET_PORT=9333`
+</details>
 
-**"I set timeout=900000 but it still times out in ~2-3 minutes"**
-- `comet_ask`'s `timeout` controls how long this server will poll for completion (newer versions default to 60s to encourage using `comet_poll`), but your MCP client may enforce its own per-request timeout.
-- If your client supports MCP progress notifications, newer versions of `comet-mcp` will emit `notifications/progress` heartbeats to help keep long requests alive.
-- If the call still returns early, use `comet_poll` to continue monitoring and retrieve the final response.
+<details>
+<summary><strong>Comet steals keyboard focus</strong></summary>
 
-**"I don't want Comet chats to affect my normal Perplexity account history"**
-- `comet_ask` enables Perplexity "隐身" (incognito) mode by default via the `tempChat` parameter (best-effort; UI/account dependent).
-- Set `tempChat: false` in your `comet_ask` call to disable this behavior.
+Default behavior avoids foregrounding. Only set `COMET_FOREGROUND=1` if you want it.
+</details>
 
-**"Claude Code says the tool response was truncated"**
-- This can happen if the response text is very long and the MCP client/UI enforces its own display/size limits.
-- Newer versions of `comet-mcp` limit `comet_ask` output by default (`maxOutputChars`, default 24000) and support paging the final response via `comet_poll` with `offset`/`limit`.
+<details>
+<summary><strong>Timeout issues</strong></summary>
 
-**"Using mcporter: I ran comet_connect, but a later call says 'Not connected to Comet'"**
-- MCPorter can launch a new stdio process per `mcporter call`, so in-memory connection state may not carry over.
-- Newer versions of `comet-mcp` auto-connect on every tool call; alternatively enable MCPorter keep-alive/daemon for this server to reuse a single process across calls.
+- `comet_ask` defaults to 60s timeout
+- Your MCP client may have its own timeout
+- Use `comet_poll` for long-running tasks
+</details>
 
-**"Result is visible in Comet, but mcporter/Claude Code call never returns"**
-- This is usually caused by UI state detection not flipping to "completed" reliably (e.g. the page still looks "working" even though the answer is already rendered).
-- Newer versions of `comet-mcp` include a fallback that returns once the latest answer text becomes stable and loading indicators stop.
-- If you still hit it, run `comet_poll` to confirm the latest response text is present, then share the `comet_poll` output so we can tune selectors for your UI variant.
+<details>
+<summary><strong>Response truncated</strong></summary>
 
-**"Tools not showing in Claude"**
-- Restart Claude Code after config changes
+- Default `maxOutputChars` is 24000
+- Use `comet_poll` with `offset`/`limit` to page through large responses
+</details>
+
+<details>
+<summary><strong>Tools not showing in Claude</strong></summary>
+
+Restart Claude Code after config changes.
+</details>
+
+## MCPorter Notes
+
+- All tools auto-connect; `comet_connect` is optional
+- Enable daemon/keep-alive mode to persist state across calls
 
 ## License
 
@@ -157,4 +190,4 @@ MIT
 
 ---
 
-[Report Issues](https://github.com/hanzili/comet-mcp/issues) · [Contribute](https://github.com/hanzili/comet-mcp)
+[Issues](https://github.com/hanzili/comet-mcp/issues) · [Contribute](https://github.com/hanzili/comet-mcp)
