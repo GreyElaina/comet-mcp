@@ -62,15 +62,47 @@ Claude: [connects to Comet, delegates research, monitors progress, returns resul
 | Tool | Description |
 |------|-------------|
 | `comet_connect` | Connect to Comet (auto-starts if needed) |
-| `comet_ask` | Send a task and wait for response |
-| `comet_poll` | Check task progress |
+| `comet_ask` | Send a task and wait for response. Params: `mode`, `tempChat` (default: true), `reasoning`, `attachments` |
+| `comet_poll` | Check task progress. Use `includeSettings` to show current mode/tempChat/model/reasoning |
 | `comet_debug` | Dump CDP/UI status for debugging |
 | `comet_stop` | Stop current task |
-| `comet_screenshot` | Capture current page |
-| `comet_mode` | Switch modes: search, research, labs, learn |
-| `comet_models` | List available Perplexity models (best-effort) |
-| `comet_model` | Switch Perplexity model by name (best-effort) |
-| `comet_temp_chat` | Inspect/toggle Perplexity “隐身” (temporary/incognito) mode (best-effort) |
+| `comet_screenshot` | Capture current page (saves as a resource) |
+| `comet_list_models` | List available Perplexity models (best-effort) |
+| `comet_set_model` | Switch Perplexity model by name (best-effort) |
+
+### File attachments
+
+`comet_ask` supports attaching files (images, PDFs, etc.) for Perplexity to analyze:
+
+```json
+{
+  "prompt": "Describe this image",
+  "attachments": ["/path/to/image.png"]
+}
+```
+
+- Accepts local file paths or `file://` URIs
+- Supported formats: png, jpg, jpeg, gif, webp, pdf, txt, csv, md
+- Max file size: 25MB per file
+- Multiple files can be attached in a single request
+
+### Screenshots & resources
+
+`comet_screenshot` no longer dumps base64 blobs into the tool response. Instead it writes the PNG to your OS temp directory (e.g. `/tmp/comet-mcp/screenshots`) and returns a `resource_link` pointing at `comet://screenshots/<filename>`. Use the standard MCP resource APIs to retrieve the data:
+
+- `resources/list` shows every retained screenshot, newest first.
+- `resources/read` downloads the referenced file with the correct MIME type.
+
+Older screenshots are pruned automatically. By default we keep 20 files for up to 30 minutes; override via `COMET_SCREENSHOT_MAX` (count) and `COMET_SCREENSHOT_TTL_MS` (milliseconds) if you need longer retention.
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COMET_PORT` | `9222` | CDP debug port (change if 9222 conflicts with other Chrome debuggers) |
+| `COMET_FOREGROUND` | unset | Set to `1` to bring Comet window to front on connect |
+| `COMET_SCREENSHOT_MAX` | `20` | Maximum screenshots to retain |
+| `COMET_SCREENSHOT_TTL_MS` | `1800000` | Screenshot retention time (30 min) |
 
 ## Architecture
 
@@ -88,7 +120,8 @@ Claude Code <-> MCP <-> comet-mcp <-> CDP <-> Comet Browser <-> Perplexity AI
 
 **"Cannot connect to Comet"**
 - Make sure Comet is installed at `/Applications/Comet.app`
-- Check if port 9222 is available (no other Chrome/debugger using it)
+- Check if the debug port is available (default 9222, configurable via `COMET_PORT` env var)
+- If port 9222 conflicts with another Chrome debugger, set `COMET_PORT=9333` (or any free port)
 
 **"Comet keeps popping to the front / steals my keyboard focus"**
 - Newer versions avoid foregrounding by default. Set `COMET_FOREGROUND=1` only if you explicitly want the tab/window to be brought to front.
@@ -99,8 +132,8 @@ Claude Code <-> MCP <-> comet-mcp <-> CDP <-> Comet Browser <-> Perplexity AI
 - If the call still returns early, use `comet_poll` to continue monitoring and retrieve the final response.
 
 **"I don't want Comet chats to affect my normal Perplexity account history"**
-- Newer versions of `comet-mcp` will try to enable Perplexity “隐身” mode (from the account dropdown) before sending prompts via `comet_ask` (best-effort; UI/account dependent).
-- You can also manually inspect or toggle it via `comet_temp_chat`.
+- `comet_ask` enables Perplexity "隐身" (incognito) mode by default via the `tempChat` parameter (best-effort; UI/account dependent).
+- Set `tempChat: false` in your `comet_ask` call to disable this behavior.
 
 **"Claude Code says the tool response was truncated"**
 - This can happen if the response text is very long and the MCP client/UI enforces its own display/size limits.
