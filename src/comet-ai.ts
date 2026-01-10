@@ -50,8 +50,6 @@ const JS_HELPERS = {
     }
     return '';
   };`,
-  // Detects if a checkmark icon (#pplx-icon-check) is visible inside a menu item.
-  // Used by findIncognitoMenuItem and setTemporaryChatEnabled.
   isCheckVisible: `const isCheckVisible = (root) => {
     try {
       const uses = Array.from(root.querySelectorAll('use'));
@@ -68,6 +66,29 @@ const JS_HELPERS = {
       const container = checkUse.closest('span') || checkUse.closest('svg') || checkUse;
       return isVisible(container);
     } catch { return false; }
+  };`,
+  findStopButton: `const findStopButton = () => {
+    const getHref = (u) =>
+      u.getAttribute('href') ||
+      u.getAttribute('xlink:href') ||
+      u.getAttributeNS('http://www.w3.org/1999/xlink', 'href') ||
+      '';
+    const svgBtn = Array.from(document.querySelectorAll('button'))
+      .find(btn => {
+        if (btn.offsetParent === null || btn.disabled) return false;
+        const use = btn.querySelector('use');
+        if (!use) return false;
+        const href = getHref(use);
+        return href.includes('stop') || href.includes('player-stop');
+      });
+    if (svgBtn) return svgBtn;
+    const textPatterns = ['stop', 'cancel', 'pause', '停止', '取消', '暂停'];
+    return Array.from(document.querySelectorAll('button')).find(btn => {
+      if (btn.offsetParent === null || btn.disabled) return false;
+      const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+      const title = (btn.getAttribute('title') || '').toLowerCase();
+      return textPatterns.some(p => aria.includes(p) || title.includes(p));
+    }) || null;
   };`,
 };
 
@@ -143,6 +164,15 @@ export class CometAI {
     | { checkedAt: number; detected: boolean; enabled: boolean | null }
     | null = null;
   private cachedMode: { mode: CometMode; checkedAt: number } | null = null;
+  private defaultModel: string | null = null;
+
+  setDefaultModel(model: string | null): void {
+    this.defaultModel = model?.trim() || null;
+  }
+
+  getDefaultModel(): string | null {
+    return this.defaultModel;
+  }
 
   async detectMode(): Promise<{ mode: CometMode; hasAgentBrowsing: boolean }> {
     const tabs = await cometClient.listTabsCategorized().catch(() => null);
@@ -161,6 +191,20 @@ export class CometAI {
     }
     const { mode } = await this.detectMode();
     return mode === "agent";
+  }
+
+  async getPerplexityUIMode(): Promise<"search" | "research" | "studio" | null> {
+    const result = await cometClient.safeEvaluate(`
+      (() => {
+        const checked = document.querySelector('button[role="radio"][aria-checked="true"]');
+        return checked ? checked.getAttribute('value') : null;
+      })()
+    `);
+    const value = result.result.value as string | null;
+    if (value === "search" || value === "research" || value === "studio") {
+      return value;
+    }
+    return null;
   }
 
   private async closeOverlays(): Promise<void> {
@@ -734,77 +778,41 @@ export class CometAI {
 
     await cometClient.connectToMain().catch(() => {});
 
+    const uiMode = await this.getPerplexityUIMode();
+    if (uiMode && uiMode !== "search") {
+      return {
+        currentModel: null,
+        availableModels: [],
+        supportsModelSwitching: false,
+        mode,
+        debug: includeRaw ? { mode, uiMode, reason: `Model switching only available in search mode (current: ${uiMode})` } : undefined,
+      };
+    }
+
     const base = await cometClient.safeEvaluate(`
       (() => {
-        const EXCLUDED = new Set(['search', 'research', 'labs', 'learn']);
-        const MODEL_WORDS = [
-          'gpt', 'openai', 'claude', 'anthropic', 'sonar', 'llama', 'gemini',
-          'mistral', 'deepseek', 'qwen', 'o1', 'o3', 'o4', 'opus', 'sonnet', 'haiku',
-          'grok', 'kimi', 'flash', 'pro'
-        ];
-        const looksLikeModel = (text) => {
-          const t = (text || '').trim();
-          if (!t) return false;
-          const lower = t.toLowerCase();
-          if (EXCLUDED.has(lower)) return false;
-          if (lower.length < 2) return false;
-          return MODEL_WORDS.some(w => lower.includes(w));
+        const cpuUse = Array.from(document.querySelectorAll('use')).find(u => 
+          u.getAttribute('xlink:href')?.includes('cpu') && 
+          u.closest('button')?.getAttribute('aria-haspopup') !== 'dialog'
+        );
+        const trigger = cpuUse?.closest('button') || null;
+        const currentModel = trigger?.getAttribute('aria-label') || null;
+
+        const debug = { 
+          hasCpuIcon: !!cpuUse, 
+          triggerAria: currentModel,
+          triggerHaspopup: trigger?.getAttribute('aria-haspopup') 
         };
-
-        const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
-
-        const candidates = [];
-        const buttons = Array.from(document.querySelectorAll('button, [role="combobox"], [aria-haspopup="listbox"], [aria-haspopup="menu"]'));
-        for (const el of buttons) {
-          const text = normalize(el.innerText || el.textContent || '');
-          const aria = normalize(el.getAttribute('aria-label') || '');
-          const title = normalize(el.getAttribute('title') || '');
-
-          const combined = [text, aria, title].filter(Boolean).join(' | ');
-          if (!combined) continue;
-
-          // Heuristic: model selector triggers often mention "model" or show model name.
-          const combinedLower = combined.toLowerCase();
-          const isModeButton = EXCLUDED.has(text.toLowerCase());
-          if (isModeButton) continue;
-
-          const mentionsModel = combinedLower.includes('model');
-          const showsModelName = looksLikeModel(text) || looksLikeModel(aria) || looksLikeModel(title);
-
-          if (!mentionsModel && !showsModelName) continue;
-
-          // Prefer visible elements near the input area if possible.
-          const rect = (el instanceof Element) ? el.getBoundingClientRect() : null;
-          const visible = !!rect && rect.width > 0 && rect.height > 0;
-          if (!visible) continue;
-
-          candidates.push({ el, text, aria, title, mentionsModel, showsModelName });
-        }
-
-        // Pick a trigger: prefer one that mentions "model", otherwise a visible one that shows model name.
-        const trigger = candidates.find(c => c.mentionsModel) || candidates.find(c => c.showsModelName) || null;
-
-        // Try to infer current model from trigger text if it looks like a model.
-        let currentModel = null;
-        if (trigger) {
-          const maybe = trigger.text || trigger.aria || trigger.title;
-          if (looksLikeModel(maybe)) currentModel = normalize(maybe);
-        }
-
-        const debug = { triggerText: trigger?.text || null, triggerAria: trigger?.aria || null, triggerTitle: trigger?.title || null, triggerCandidates: candidates.length };
 
         let opened = false;
         let dataStateBefore = null;
         let dataStateAfter = null;
         if (${openMenu} && trigger) {
           try {
-            dataStateBefore = trigger.el.getAttribute('data-state');
-            trigger.el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-            trigger.el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-            trigger.el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-            trigger.el.click();
+            dataStateBefore = trigger.getAttribute('data-state');
+            trigger.click();
             opened = true;
-            dataStateAfter = trigger.el.getAttribute('data-state');
+            dataStateAfter = trigger.getAttribute('data-state');
           } catch {}
         }
 
@@ -838,33 +846,9 @@ export class CometAI {
       debug?: unknown;
     };
 
-    const readMenuItems = async (onlyVisible: boolean): Promise<{ items: string[]; diagnostics: unknown }> => {
+    const readMenuItems = async (onlyVisible: boolean): Promise<{ items: Array<{ name: string; selected: boolean }>; diagnostics: unknown }> => {
       const res = await cometClient.safeEvaluate(`
         (() => {
-          const EXCLUDED = new Set(['search', 'research', 'labs', 'learn', '最佳', '带着推理', '托管在美国', '最大', '推理', '正在思考']);
-          const MODEL_PATTERNS = [
-            /\\b(gpt[- ]?\\d+\\.?\\d*[a-z]*)/i,
-            /\\b(claude\\s+\\w+(?:\\s+\\d+\\.?\\d*)?)/i,
-            /\\b(sonar\\s*\\w*)/i,
-            /\\b(gemini\\s+\\d*\\.?\\d*\\s*\\w*)/i,
-            /\\b(grok\\s*\\d*\\.?\\d*)/i,
-            /\\b(kimi\\s+\\w+)/i,
-            /\\b(llama\\s*\\d*\\.?\\d*\\s*\\w*)/i,
-            /\\b(mistral\\s*\\w*)/i,
-            /\\b(deepseek\\s*\\w*)/i,
-            /\\b(qwen\\s*\\d*\\.?\\d*\\s*\\w*)/i,
-            /\\b(o[134]-?\\w*)/i,
-          ];
-          const extractModelName = (text) => {
-            const t = (text || '').trim();
-            for (const pattern of MODEL_PATTERNS) {
-              const match = t.match(pattern);
-              if (match) return match[1].trim();
-            }
-            return null;
-          };
-          const looksLikeModel = (text) => extractModelName(text) !== null;
-          const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
           const onlyVisible = ${onlyVisible};
           const isVisible = (el) => {
             if (!onlyVisible) return true;
@@ -884,74 +868,38 @@ export class CometAI {
             menuCount: 0,
             menuitemCount: 0,
             triggerDataState: null,
-            fixedPopups: 0,
-            shadowOverlays: 0,
-            allMenuItems: [],
           };
           
-          const triggerButton = document.querySelector('button[aria-label*="Gemini"], button[aria-label*="Claude"], button[aria-label*="GPT"], button[aria-label*="Sonar"], button[aria-label*="Grok"], button[aria-label*="Kimi"]');
+          const cpuUse = Array.from(document.querySelectorAll('use')).find(u => 
+            u.getAttribute('xlink:href')?.includes('cpu') && 
+            u.closest('button')?.getAttribute('aria-haspopup') !== 'dialog'
+          );
+          const triggerButton = cpuUse?.closest('button');
           if (triggerButton) {
             diagnostics.triggerDataState = triggerButton.getAttribute('data-state');
           }
           
           diagnostics.menuCount = document.querySelectorAll('[role="menu"]').length;
-          diagnostics.fixedPopups = document.querySelectorAll('div[style*="position: fixed"]').length;
-          diagnostics.shadowOverlays = document.querySelectorAll('.shadow-overlay').length;
           
-          const items = new Set();
-          
-          let menuItems = document.querySelectorAll('[role="menu"] [role="menuitem"]');
-          
-          if (menuItems.length === 0) {
-            menuItems = document.querySelectorAll('.shadow-overlay [role="menuitem"]');
-          }
-          if (menuItems.length === 0) {
-            menuItems = document.querySelectorAll('div[style*="position: fixed"] [role="menuitem"]');
-          }
-          if (menuItems.length === 0) {
-            menuItems = document.querySelectorAll('[role="menuitem"]');
-          }
-          
+          const items = [];
+          const menuItems = document.querySelectorAll('[role="menu"] [role="menuitem"]');
           diagnostics.menuitemCount = menuItems.length;
           
           for (const item of menuItems) {
             if (!isVisible(item)) continue;
-            
-            const rawText = (item.innerText || item.textContent || '').trim();
-            const firstLine = rawText.split('\\n')[0].trim();
-            const normalized = normalize(firstLine);
-            const extracted = extractModelName(normalized);
-            
-            if (normalized) {
-              diagnostics.allMenuItems.push(normalized.substring(0, 30));
-              if (extracted && !EXCLUDED.has(extracted) && !EXCLUDED.has(extracted.toLowerCase())) {
-                items.add(extracted);
-              }
-            }
+            const nameEl = item.querySelector('.flex-1 span');
+            const name = nameEl?.textContent?.trim();
+            if (!name) continue;
+            const checkSvg = item.querySelector('svg use[*|href*="check"]')?.closest('svg');
+            const selected = checkSvg && !checkSvg.classList.contains('opacity-0');
+            items.push({ name, selected });
           }
           
-          if (items.size === 0) {
-            const allMenuitems = document.querySelectorAll('[role="menuitem"]');
-            for (const item of allMenuitems) {
-              if (!isVisible(item)) continue;
-              const rawText = (item.innerText || item.textContent || '').trim();
-              if (!rawText) continue;
-              const lines = rawText.split('\\n').map(l => l.trim()).filter(Boolean);
-              for (const line of lines) {
-                const normalized = normalize(line);
-                const extracted = extractModelName(normalized);
-                if (!extracted) continue;
-                if (EXCLUDED.has(extracted) || EXCLUDED.has(extracted.toLowerCase())) continue;
-                items.add(extracted);
-              }
-            }
-          }
-          
-          return { items: Array.from(items), diagnostics };
+          return { items, diagnostics };
         })()
       `);
       if (res.exceptionDetails || res.result.value == null) return { items: [], diagnostics: null };
-      const result = res.result.value as { items: string[]; diagnostics: unknown };
+      const result = res.result.value as { items: Array<{ name: string; selected: boolean }>; diagnostics: unknown };
       return result;
     };
 
@@ -960,14 +908,14 @@ export class CometAI {
     }
 
     let menuResult = await readMenuItems(openMenu);
-    let availableModels = menuResult.items;
+    let availableModels = menuResult.items.map(i => i.name);
     let lastDiagnostics = menuResult.diagnostics;
     
     if (openMenu && baseValue.opened && availableModels.length === 0) {
       for (let i = 0; i < 15; i++) {
         await new Promise((r) => setTimeout(r, 150));
         menuResult = await readMenuItems(true);
-        availableModels = menuResult.items;
+        availableModels = menuResult.items.map(i => i.name);
         lastDiagnostics = menuResult.diagnostics;
         if (availableModels.length) break;
       }
@@ -1002,40 +950,19 @@ export class CometAI {
   private async openModelMenu(): Promise<boolean> {
     const openResult = await cometClient.safeEvaluate(`
       (() => {
-        const EXCLUDED = new Set(['search', 'research', 'labs', 'learn']);
-        const MODEL_WORDS = ['gpt', 'openai', 'claude', 'anthropic', 'sonar', 'llama', 'gemini', 'mistral', 'deepseek', 'qwen', 'o1', 'o3', 'o4', 'opus', 'sonnet', 'haiku', 'grok', 'kimi', 'flash', 'pro'];
-        const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
-        const looksLikeModel = (text) => {
-          const t = (text || '').trim();
-          if (!t) return false;
-          const lower = t.toLowerCase();
-          if (EXCLUDED.has(lower)) return false;
-          if (lower.length < 2) return false;
-          return MODEL_WORDS.some(w => lower.includes(w));
-        };
-        const buttons = Array.from(document.querySelectorAll('button, [role="combobox"], [aria-haspopup="listbox"], [aria-haspopup="menu"]'));
-        for (const el of buttons) {
-          const text = normalize(el.innerText || el.textContent || '');
-          const aria = normalize(el.getAttribute('aria-label') || '');
-          const title = normalize(el.getAttribute('title') || '');
-          const combined = [text, aria, title].filter(Boolean).join(' | ');
-          if (!combined) continue;
-          if (EXCLUDED.has(text.toLowerCase())) continue;
-          const rect = el.getBoundingClientRect();
-          if (rect.width <= 0 || rect.height <= 0) continue;
-          
-          const mentionsModel = combined.toLowerCase().includes('model');
-          const showsModelName = looksLikeModel(text) || looksLikeModel(aria) || looksLikeModel(title);
-          
-          if (mentionsModel || showsModelName) {
-            el.click();
-            return { clicked: true, aria, text, buttonsCount: buttons.length };
-          }
+        const cpuUse = Array.from(document.querySelectorAll('use')).find(u => 
+          u.getAttribute('xlink:href')?.includes('cpu') && 
+          u.closest('button')?.getAttribute('aria-haspopup') !== 'dialog'
+        );
+        const btn = cpuUse?.closest('button');
+        if (btn) {
+          btn.click();
+          return { clicked: true, aria: btn.getAttribute('aria-label') };
         }
-        return { clicked: false, buttonsCount: buttons.length };
+        return { clicked: false };
       })()
     `);
-    const value = openResult.result?.value as { clicked: boolean; aria?: string; text?: string; buttonsCount?: number } | undefined;
+    const value = openResult.result?.value as { clicked: boolean; aria?: string } | undefined;
     if (openResult.exceptionDetails || !value?.clicked) {
       return false;
     }
@@ -1213,7 +1140,44 @@ export class CometAI {
     };
   }
 
-  async setModel(modelName: string): Promise<{
+  async ensureModel(targetModel?: string): Promise<{
+    changed: boolean;
+    currentModel: string | null;
+    targetModel: string | null;
+    skipped?: string;
+  }> {
+    const target = targetModel?.trim() || this.defaultModel;
+    if (!target) {
+      return { changed: false, currentModel: null, targetModel: null, skipped: "no target model" };
+    }
+
+    const { mode } = await this.detectMode();
+    if (mode === "agent") {
+      return { changed: false, currentModel: null, targetModel: target, skipped: "agent mode" };
+    }
+
+    const uiMode = await this.getPerplexityUIMode();
+    if (uiMode && uiMode !== "search") {
+      return { changed: false, currentModel: null, targetModel: target, skipped: `ui mode is ${uiMode}` };
+    }
+
+    const info = await this.getModelInfo({ openMenu: false });
+    const current = info.currentModel?.toLowerCase() || "";
+    const targetLower = target.toLowerCase();
+
+    if (current === targetLower || current.includes(targetLower) || targetLower.includes(current)) {
+      return { changed: false, currentModel: info.currentModel, targetModel: target, skipped: "already selected" };
+    }
+
+    const result = await this.switchModel(target);
+    return {
+      changed: result.changed,
+      currentModel: result.currentModel,
+      targetModel: target,
+    };
+  }
+
+  private async switchModel(modelName: string): Promise<{
     changed: boolean;
     currentModel: string | null;
     availableModels: string[];
@@ -1240,22 +1204,29 @@ export class CometAI {
       };
     }
 
+    const uiMode = await this.getPerplexityUIMode();
+    if (uiMode && uiMode !== "search") {
+      return {
+        changed: false,
+        currentModel: null,
+        availableModels: [],
+        mode,
+        debug: `Model switching only available in search mode (current: ${uiMode})`,
+      };
+    }
+
     const infoBefore = await this.getModelInfo({ openMenu: false, includeRaw: true });
     
     const openMenuResult = await cometClient.safeEvaluate(`
       (() => {
-        const MODEL_WORDS = ['gpt', 'openai', 'claude', 'anthropic', 'sonar', 'llama', 'gemini', 'mistral', 'deepseek', 'qwen', 'o1', 'o3', 'o4', 'opus', 'sonnet', 'haiku', 'grok', 'kimi', 'flash', 'pro'];
-        const looksLikeModel = (text) => {
-          const t = (text || '').trim().toLowerCase();
-          return t && MODEL_WORDS.some(w => t.includes(w));
-        };
-        const buttons = document.querySelectorAll('button');
-        for (const btn of buttons) {
-          const aria = btn.getAttribute('aria-label') || '';
-          if (looksLikeModel(aria)) {
-            btn.click();
-            return { clicked: true, aria };
-          }
+        const cpuUse = Array.from(document.querySelectorAll('use')).find(u => 
+          u.getAttribute('xlink:href')?.includes('cpu') && 
+          u.closest('button')?.getAttribute('aria-haspopup') !== 'dialog'
+        );
+        const btn = cpuUse?.closest('button');
+        if (btn) {
+          btn.click();
+          return { clicked: true, aria: btn.getAttribute('aria-label') };
         }
         return { clicked: false };
       })()
@@ -1631,38 +1602,10 @@ export class CometAI {
 
     const result = await cometClient.safeEvaluate(`
       (() => {
-        // Force fresh read
         const body = document.body.innerText;
 
-        // Check for ACTIVE stop button - multiple detection methods
-        let hasActiveStopButton = false;
-        const stopButtons = document.querySelectorAll('button');
-        for (const btn of stopButtons) {
-          if (btn.offsetParent === null || btn.disabled) continue;
-
-          const ariaLabel = btn.getAttribute('aria-label') || '';
-          const title = btn.getAttribute('title') || '';
-          const ariaLower = ariaLabel.toLowerCase();
-          const titleLower = title.toLowerCase();
-          const stopish =
-            ariaLower.includes('stop') ||
-            ariaLower.includes('cancel') ||
-            ariaLower.includes('pause') ||
-            titleLower.includes('stop') ||
-            titleLower.includes('cancel') ||
-            titleLower.includes('pause') ||
-            ariaLabel.includes('停止') ||
-            ariaLabel.includes('取消') ||
-            ariaLabel.includes('暂停') ||
-            title.includes('停止') ||
-            title.includes('取消') ||
-            title.includes('暂停');
-
-          if (stopish) {
-            hasActiveStopButton = true;
-            break;
-          }
-        }
+        ${JS_HELPERS.findStopButton}
+        const hasActiveStopButton = findStopButton() !== null;
 
         // Check submit button state - key signal for sidecar mode
         // Working: submit button doesn't exist (null)
@@ -1687,30 +1630,28 @@ export class CometAI {
         const hasFinishedMarker = body.includes('Finished') && !hasActiveStopButton;
         const hasReviewedSources = /Reviewed \\d+ sources?/i.test(body);
 
-        // Working indicators
-        const workingPatterns = [
-          'Working…', 'Working...', 'Searching', 'Reviewing sources',
-          'Preparing to assist', 'Clicking', 'Typing:', 'Navigating to',
-          'Reading', 'Analyzing', 'Generating', 'Thinking', 'Writing',
-          // Chinese patterns
-          '正在思考', '正在搜索', '搜索中', '思考中', '正在生成', '正在处理', '正在分析', '正在回答'
-        ];
-        const hasWorkingText = workingPatterns.some(p => body.includes(p));
+        // Structural working indicators (language-agnostic)
+        // .shimmer class only appears during active thinking/processing
+        const hasShimmer = document.querySelector('[role="tabpanel"] .shimmer') !== null;
+        
+        // Structural completed indicator - collapsed steps button with chevron icon
+        const hasCompletedStepsButton = document.querySelector(
+          '[role="tabpanel"] button.reset.interactable svg use[href*="chevron"], ' +
+          '[role="tabpanel"] button.reset.interactable svg use[xlink\\\\:href*="chevron"]'
+        ) !== null;
 
         let status = 'idle';
         
         if (submitExistsAndDisabled && latestResponse.length > 5) {
           status = 'completed';
-        } else if (hasActiveStopButton || hasLoadingSpinner) {
+        } else if (hasActiveStopButton || hasLoadingSpinner || hasShimmer) {
           status = 'working';
-        } else if (hasStepsCompleted || hasFinishedMarker) {
+        } else if (hasCompletedStepsButton || hasStepsCompleted || hasFinishedMarker) {
           status = 'completed';
         } else if (hasReviewedSources) {
           status = 'completed';
         } else if (!hasActiveStopButton && !hasLoadingSpinner && latestResponse.length > 5) {
           status = 'completed';
-        } else if (submitMissing && hasWorkingText) {
-          status = 'working';
         } else if (submitMissing) {
           status = 'idle';
         }
@@ -1838,43 +1779,30 @@ export class CometAI {
   }
 
   async stopAgent(): Promise<boolean> {
-    let hasSidecar = false;
-    try {
-      const tabs = await cometClient.listTabsCategorized();
-      hasSidecar = !!tabs.sidecar;
-      if (hasSidecar) {
-        await cometClient.connectToSidecar();
-      }
-    } catch {}
+    const status = await this.getAgentStatus();
+    if (!status.hasStopButton) {
+      return false;
+    }
 
     const result = await cometClient.safeEvaluate(`
       (() => {
-        const stopPatterns = ['Stop', 'Cancel', 'Pause', '停止', '取消', '暂停', 'Arrêter', 'Stoppen', 'Detener'];
-        const buttons = document.querySelectorAll('button[aria-label]');
-        for (const btn of buttons) {
-          if (btn.offsetParent === null || btn.disabled) continue;
-          const label = btn.getAttribute('aria-label') || '';
-          if (stopPatterns.some(p => label.toLowerCase().includes(p.toLowerCase()))) {
-            btn.click();
-            return true;
-          }
-        }
-
-        const stopBtn = document.querySelector('button svg use[*|href*="stop"]')?.closest('button');
-        if (stopBtn && stopBtn.offsetParent !== null) {
-          stopBtn.click();
+        ${JS_HELPERS.findStopButton}
+        const btn = findStopButton();
+        if (btn) {
+          btn.click();
           return true;
         }
-
         return false;
       })()
     `);
 
-    if (hasSidecar) {
+    const clicked = result.result.value as boolean;
+
+    if (clicked) {
       await cometClient.connectToMain().catch(() => {});
     }
 
-    return result.result.value as boolean;
+    return clicked;
   }
 
   async exitAgentMode(): Promise<{ exited: boolean; reason?: string }> {

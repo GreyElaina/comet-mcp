@@ -219,7 +219,8 @@ FORMATTING WARNING:
         force: { type: "boolean", description: "Force sending a new prompt even if Comet appears busy (default: false). Prefer comet_poll or comet_stop." },
         maxOutputChars: { type: "number", description: "Limit returned text length (chars). If truncated, use comet_poll with offset/limit to page (default: 24000)." },
         tempChat: { type: "boolean", description: "Enable/disable Perplexity temporary/private chat mode (default: true). Set to false to disable incognito mode." },
-        mode: { type: "string", enum: ["search", "research", "labs", "learn"], description: "Perplexity search mode: 'search' (basic), 'research' (deep), 'labs' (analytics), 'learn' (educational). If omitted, uses current mode." },
+        mode: { type: "string", enum: ["search", "research", "studio"], description: "Perplexity mode: 'search' (basic), 'research' (deep), 'studio' (labs/analytics). If omitted, uses current mode." },
+        model: { type: "string", description: "Perplexity model to use (e.g. 'gpt-4o', 'claude-sonnet'). Only works in search mode. If omitted, uses current model." },
         agentPolicy: { type: "string", enum: ["exit", "continue"], description: "Behavior when in agent mode (browsing a website): 'exit' (default) exits agent mode and returns to search, 'continue' sends prompt to sidecar to continue browsing." },
         reasoning: { type: "boolean", description: "Enable/disable reasoning mode (带着推理). Only available in search mode with certain models." },
         attachments: { type: "array", items: { type: "string" }, description: "File paths or file:// URIs to attach (supports: png, jpg, gif, webp, pdf, txt, csv, md). Max 25MB per file." },
@@ -277,14 +278,12 @@ FORMATTING WARNING:
   {
     name: "comet_set_model",
     description:
-      "Switch Perplexity model by name (best-effort; depends on account/UI). Use comet_list_models first to see available options.",
+      "Set default Perplexity model for subsequent comet_ask calls. Model will be switched automatically when needed. Use comet_list_models to see available options. Call with empty name to clear default.",
     inputSchema: {
       type: "object",
       properties: {
-        name: { type: "string", description: "Model name (case-insensitive substring match)" },
-        includeRaw: { type: "boolean", description: "Include debug details (default: false)" },
+        name: { type: "string", description: "Model name (case-insensitive substring match). Empty to clear." },
       },
-      required: ["name"],
     },
   },
 ];
@@ -464,6 +463,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         const agentPolicy = ((args as any)?.agentPolicy as string) || "exit";
         const reasoning = (args as any)?.reasoning as boolean | undefined;
         const blocking = (args as any)?.blocking !== false;
+        const model = (args as any)?.model as string | undefined;
 
         // Guard: don't accidentally start a new prompt while an agentic run is in-flight.
         const preStatus = await cometAI.getAgentStatus();
@@ -508,54 +508,25 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
           const currentUrl = urlResult.result.value as string;
           const isOnPerplexity = currentUrl?.includes('perplexity.ai');
 
-          if (newChat || !isOnPerplexity) {
+          const wantsModelSwitch = (model || cometAI.getDefaultModel()) && (!mode || mode === "search");
+          if (newChat || !isOnPerplexity || wantsModelSwitch) {
             await cometClient.navigate("https://www.perplexity.ai/", true);
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
 
           if (mode) {
-            const modeMap: Record<string, string> = {
-              search: "Search",
-              research: "Research",
-              labs: "Labs",
-              learn: "Learn",
-            };
-            const ariaLabel = modeMap[mode];
-            if (ariaLabel) {
-              sendProgress(`Switching to ${mode} mode…`, 3, 100);
-              await cometClient.safeEvaluate(`
-                (() => {
-                  const targetLabel = ${JSON.stringify(ariaLabel)};
-                  const btn = document.querySelector('button[aria-label="' + targetLabel + '"]');
-                  if (btn) { btn.click(); return true; }
-                  const allButtons = document.querySelectorAll('button');
-                  for (const b of allButtons) {
-                    const text = b.innerText.toLowerCase();
-                    if ((text.includes('search') || text.includes('research') ||
-                         text.includes('labs') || text.includes('learn')) && b.querySelector('svg')) {
-                      b.click();
-                      return 'dropdown';
-                    }
-                  }
-                  return false;
-                })()
-              `);
-              await new Promise(resolve => setTimeout(resolve, 300));
-              await cometClient.safeEvaluate(`
-                (() => {
-                  const targetMode = ${JSON.stringify(mode)};
-                  const items = document.querySelectorAll('[role="menuitem"], [role="option"], button');
-                  for (const item of items) {
-                    if (item.innerText.toLowerCase().includes(targetMode)) {
-                      item.click();
-                      return true;
-                    }
-                  }
-                  return false;
-                })()
-              `);
-              await new Promise(resolve => setTimeout(resolve, 200));
-            }
+            sendProgress(`Switching to ${mode} mode…`, 3, 100);
+            await cometClient.safeEvaluate(`
+              (() => {
+                const radio = document.querySelector('button[role="radio"][value="${mode}"]');
+                if (radio && radio.getAttribute('aria-checked') !== 'true') {
+                  radio.click();
+                  return true;
+                }
+                return false;
+              })()
+            `);
+            await new Promise(resolve => setTimeout(resolve, 300));
           }
 
           try {
@@ -574,6 +545,21 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
             }
           } catch {
             // Best-effort only; continue with the prompt.
+          }
+
+          const targetModel = model || cometAI.getDefaultModel();
+          if (targetModel) {
+            sendProgress(`Checking model: ${targetModel}…`, 6, 100);
+            try {
+              const modelResult = await cometAI.ensureModel(targetModel);
+              if (modelResult.changed) {
+                sendProgress(`Switched to model: ${modelResult.currentModel}`, 7, 100);
+              } else if (modelResult.skipped) {
+                console.error(`[comet] ensureModel skipped: ${modelResult.skipped}`);
+              }
+            } catch (e) {
+              console.error(`[comet] ensureModel error:`, e);
+            }
           }
 
           if (typeof reasoning === "boolean") {
@@ -812,21 +798,8 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         if (includeSettings) {
           const modeResult = await cometClient.safeEvaluate(`
             (() => {
-              const modes = ['Search', 'Research', 'Labs', 'Learn'];
-              for (const mode of modes) {
-                const btn = document.querySelector('button[aria-label="' + mode + '"]');
-                if (btn && btn.getAttribute('data-state') === 'checked') {
-                  return mode.toLowerCase();
-                }
-              }
-              const dropdownBtn = document.querySelector('button[class*="gap"]');
-              if (dropdownBtn) {
-                const text = dropdownBtn.innerText.toLowerCase();
-                if (text.includes('search')) return 'search';
-                if (text.includes('research')) return 'research';
-                if (text.includes('labs')) return 'labs';
-                if (text.includes('learn')) return 'learn';
-              }
+              const checked = document.querySelector('button[role="radio"][aria-checked="true"]');
+              if (checked) return checked.getAttribute('value') || 'search';
               return 'search';
             })()
           `);
@@ -934,30 +907,17 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       }
 
       case "comet_set_model": {
-        await ensureConnectedToComet();
-        const name = String((args as any)?.name ?? "");
-        const includeRaw = (args as any)?.includeRaw === true;
+        const name = String((args as any)?.name ?? "").trim();
+        const previous = cometAI.getDefaultModel();
+        cometAI.setDefaultModel(name || null);
 
-        const res = await cometAI.setModel(name);
         const lines = [
-          `Mode: ${res.mode}`,
-          `Requested: ${name}`,
-          `Changed: ${res.changed ? "yes" : "no"}`,
-          `Current model: ${res.currentModel ?? "(unknown)"}`,
+          `Default model ${name ? "set" : "cleared"}`,
+          `Previous: ${previous ?? "(none)"}`,
+          `Current: ${cometAI.getDefaultModel() ?? "(none)"}`,
           "",
-          "Available models (best-effort):",
-          ...(res.availableModels.length
-            ? res.availableModels.map((m) => `- ${m}`)
-            : ["- (none detected)"]),
+          "Note: Model will be switched on next comet_ask if needed.",
         ];
-
-        if (res.mode === "agent") {
-          lines.push("", "Note: Model switching is not available in agent mode. Use search mode instead.");
-        }
-
-        if (includeRaw && res.debug) {
-          lines.push("", "--- Debug ---", JSON.stringify(res.debug, null, 2));
-        }
 
         return { content: [{ type: "text", text: lines.join("\n") }] };
       }
