@@ -45,10 +45,9 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "chrome-remote-interface": "^0.33.2"
+    "puppeteer-core": "^24.34.0"
   },
   "devDependencies": {
-    "@types/chrome-remote-interface": "^0.31.14",
     "@types/node": "^20.10.0",
     "typescript": "^5.3.0"
   }
