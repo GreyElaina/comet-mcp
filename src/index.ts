@@ -4,11 +4,17 @@
 // Claude Code ↔ Perplexity Comet bidirectional interaction
 // Simplified to 6 essential tools
 
+import { randomUUID } from "crypto";
+import { promises as fs } from "fs";
+import os from "os";
+import path from "path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
+  ListResourcesRequestSchema,
   ListToolsRequestSchema,
+  ReadResourceRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { cometClient } from "./cdp-client.js";
@@ -36,6 +42,135 @@ const parsePositiveInt = (value: unknown): number | null => {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n) || n <= 0) return null;
   return Math.trunc(n);
+};
+
+const SCREENSHOT_DIR = path.join(os.tmpdir(), "comet-mcp", "screenshots");
+const SCREENSHOT_TTL_MS = (() => {
+  const parsed = Number(process.env.COMET_SCREENSHOT_TTL_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30 * 60 * 1000;
+})();
+const SCREENSHOT_MAX_ENTRIES = (() => {
+  const parsed = Number(process.env.COMET_SCREENSHOT_MAX ?? "20");
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 20;
+})();
+const SCREENSHOT_URI_PREFIX = "comet://screenshots";
+
+interface ScreenshotResourceEntry {
+  uri: string;
+  path: string;
+  name: string;
+  title: string;
+  description: string;
+  mimeType: string;
+  createdAt: number;
+  size: number;
+}
+
+const screenshotResources = new Map<string, ScreenshotResourceEntry>();
+let screenshotDirReady = false;
+
+const ensureScreenshotDir = async () => {
+  if (screenshotDirReady) return;
+  await fs.mkdir(SCREENSHOT_DIR, { recursive: true });
+  screenshotDirReady = true;
+};
+
+const removeScreenshotEntry = async (entry: ScreenshotResourceEntry) => {
+  screenshotResources.delete(entry.uri);
+  try {
+    await fs.unlink(entry.path);
+  } catch {}
+};
+
+const pruneScreenshotResources = async (): Promise<boolean> => {
+  await ensureScreenshotDir();
+  const now = Date.now();
+  const existing = Array.from(screenshotResources.values());
+  const toRemove = new Map<string, ScreenshotResourceEntry>();
+
+  for (const entry of existing) {
+    if (now - entry.createdAt > SCREENSHOT_TTL_MS) {
+      toRemove.set(entry.uri, entry);
+      continue;
+    }
+    try {
+      await fs.access(entry.path);
+    } catch {
+      toRemove.set(entry.uri, entry);
+    }
+  }
+
+  const survivors = existing
+    .filter((entry) => !toRemove.has(entry.uri))
+    .sort((a, b) => a.createdAt - b.createdAt);
+
+  while (survivors.length > SCREENSHOT_MAX_ENTRIES) {
+    const entry = survivors.shift();
+    if (entry) {
+      toRemove.set(entry.uri, entry);
+    }
+  }
+
+  if (!toRemove.size) return false;
+
+  await Promise.all([...toRemove.values()].map((entry) => removeScreenshotEntry(entry)));
+  return true;
+};
+
+const toResourceDescriptor = (entry: ScreenshotResourceEntry) => ({
+  name: entry.name,
+  title: entry.title,
+  uri: entry.uri,
+  description: entry.description,
+  mimeType: entry.mimeType,
+  annotations: {
+    lastModified: new Date(entry.createdAt).toISOString(),
+  },
+});
+
+const listScreenshotResourceDescriptors = () => {
+  return Array.from(screenshotResources.values())
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .map(toResourceDescriptor);
+};
+
+const toResourceLink = (entry: ScreenshotResourceEntry) => ({
+  type: "resource_link" as const,
+  ...toResourceDescriptor(entry),
+});
+
+const saveScreenshotResource = async (
+  base64Data: string,
+  mimeType: string
+): Promise<ScreenshotResourceEntry> => {
+  await ensureScreenshotDir();
+  const buffer = Buffer.from(base64Data, "base64");
+  const timestamp = Date.now();
+  const extension = mimeType === "image/jpeg" ? "jpg" : "png";
+  const fileName = `screenshot-${timestamp}-${randomUUID()}.${extension}`;
+  const filePath = path.join(SCREENSHOT_DIR, fileName);
+  await fs.writeFile(filePath, buffer);
+
+  const entry: ScreenshotResourceEntry = {
+    uri: `${SCREENSHOT_URI_PREFIX}/${fileName}`,
+    path: filePath,
+    name: fileName,
+    title: "Comet Screenshot",
+    description: `Screenshot captured at ${new Date(timestamp).toISOString()}`,
+    mimeType,
+    createdAt: timestamp,
+    size: buffer.length,
+  };
+
+  screenshotResources.set(entry.uri, entry);
+  return entry;
+};
+
+const getScreenshotEntry = (uri: string) => screenshotResources.get(uri);
+
+const readScreenshotBlob = async (entry: ScreenshotResourceEntry) => {
+  const data = await fs.readFile(entry.path);
+  return data.toString("base64");
 };
 
 const TOOLS: Tool[] = [
@@ -83,6 +218,11 @@ FORMATTING WARNING:
         newChat: { type: "boolean", description: "Start a fresh conversation (default: false)" },
         force: { type: "boolean", description: "Force sending a new prompt even if Comet appears busy (default: false). Prefer comet_poll or comet_stop." },
         maxOutputChars: { type: "number", description: "Limit returned text length (chars). If truncated, use comet_poll with offset/limit to page (default: 24000)." },
+        tempChat: { type: "boolean", description: "Enable/disable Perplexity temporary/private chat mode (default: true). Set to false to disable incognito mode." },
+        mode: { type: "string", enum: ["search", "research", "labs", "learn"], description: "Perplexity search mode: 'search' (basic), 'research' (deep), 'labs' (analytics), 'learn' (educational). If omitted, uses current mode." },
+        agentPolicy: { type: "string", enum: ["exit", "continue"], description: "Behavior when in agent mode (browsing a website): 'exit' (default) exits agent mode and returns to search, 'continue' sends prompt to sidecar to continue browsing." },
+        reasoning: { type: "boolean", description: "Enable/disable reasoning mode (带着推理). Only available in search mode with certain models." },
+        attachments: { type: "array", items: { type: "string" }, description: "File paths or file:// URIs to attach (supports: png, jpg, gif, webp, pdf, txt, csv, md). Max 25MB per file." },
       },
       required: ["prompt"],
     },
@@ -95,6 +235,7 @@ FORMATTING WARNING:
       properties: {
         offset: { type: "number", description: "Response slice start (chars). Default: 0" },
         limit: { type: "number", description: "Response slice length (chars). Default: 24000" },
+        includeSettings: { type: "boolean", description: "Include current session settings (mode, tempChat, model). Default: false" },
       },
     },
   },
@@ -121,21 +262,7 @@ FORMATTING WARNING:
     inputSchema: { type: "object", properties: {} },
   },
   {
-    name: "comet_mode",
-    description: "Switch Perplexity search mode. Modes: 'search' (basic), 'research' (deep research), 'labs' (analytics/visualization), 'learn' (educational). Call without mode to see current mode.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        mode: {
-          type: "string",
-          enum: ["search", "research", "labs", "learn"],
-          description: "Mode to switch to (optional - omit to see current mode)",
-        },
-      },
-    },
-  },
-  {
-    name: "comet_models",
+    name: "comet_list_models",
     description:
       "List available Perplexity models (best-effort; depends on account/UI). Use openMenu=true to actively open the model selector and scrape options.",
     inputSchema: {
@@ -147,9 +274,9 @@ FORMATTING WARNING:
     },
   },
   {
-    name: "comet_model",
+    name: "comet_set_model",
     description:
-      "Switch Perplexity model by name (best-effort; depends on account/UI). Use comet_models first to see available options.",
+      "Switch Perplexity model by name (best-effort; depends on account/UI). Use comet_list_models first to see available options.",
     inputSchema: {
       type: "object",
       properties: {
@@ -159,26 +286,45 @@ FORMATTING WARNING:
       required: ["name"],
     },
   },
-  {
-    name: "comet_temp_chat",
-    description:
-      "Inspect or toggle Perplexity temporary/private chat mode (best-effort; depends on account/UI). Call without enable to inspect.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        enable: { type: "boolean", description: "Enable/disable temporary chat mode (omit to only inspect)" },
-        includeRaw: { type: "boolean", description: "Include debug details (default: false)" },
-      },
-    },
-  },
 ];
 
 const server = new Server(
   { name: "comet-bridge", version: "2.0.0" },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {}, resources: { listChanged: true } } }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  await pruneScreenshotResources();
+  return { resources: listScreenshotResourceDescriptors() };
+});
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  await pruneScreenshotResources();
+  const uri = request.params.uri;
+  const entry = getScreenshotEntry(uri);
+  if (!entry) {
+    throw new Error(`Resource not found: ${uri}`);
+  }
+  try {
+    const blob = await readScreenshotBlob(entry);
+    return {
+      contents: [
+        {
+          uri: entry.uri,
+          mimeType: entry.mimeType,
+          blob,
+        },
+      ],
+    };
+  } catch (error) {
+    await removeScreenshotEntry(entry);
+    throw new Error(
+      `Failed to read resource ${uri}: ${error instanceof Error ? error.message : error}`
+    );
+  }
+});
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
@@ -216,16 +362,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
       }
     }
 
-    const startResult = await cometClient.startComet(9222);
+    const startResult = await cometClient.startComet();
 
     const targets = await cometClient.listTargets();
     const pageTabs = targets.filter((t) => t.type === "page");
 
-    // Prefer an existing Perplexity tab if present; otherwise use any visible page.
     const candidateTabs = [
       ...pageTabs.filter((t) => t.url.includes("perplexity.ai") && !t.url.includes("sidecar")),
       ...pageTabs.filter((t) => t.url.includes("perplexity.ai")),
-      ...pageTabs.filter((t) => t.url !== "about:blank"),
+      ...pageTabs.filter((t) => t.url !== "about:blank" && !t.url.startsWith("chrome://")),
     ];
 
     const seen = new Set<string>();
@@ -252,7 +397,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
     switch (name) {
       case "comet_connect": {
         // Auto-start Comet with debug port (will restart if running without it)
-        const startResult = await cometClient.startComet(9222);
+        const startResult = await cometClient.startComet();
 
         // Get all tabs and clean up - close all except one
         const targets = await cometClient.listTargets();
@@ -287,10 +432,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
       }
 
       case "comet_ask": {
-        // Ensure CDP connection exists (mcporter may launch a fresh stdio process per call)
         await ensureConnectedToComet();
 
-        const prompt = args?.prompt as string;
+        const prompt = String(args?.prompt ?? "").trim();
+        if (!prompt) {
+          return {
+            content: [{ type: "text", text: "Error: prompt is required and cannot be empty" }],
+            isError: true,
+          };
+        }
+        const MAX_PROMPT_LENGTH = 50000;
+        if (prompt.length > MAX_PROMPT_LENGTH) {
+          return {
+            content: [{ type: "text", text: `Error: prompt exceeds maximum length of ${MAX_PROMPT_LENGTH} characters` }],
+            isError: true,
+          };
+        }
         const force = (args as any)?.force === true;
         const maxOutputChars = parsePositiveInt((args as any)?.maxOutputChars) ?? 24000;
         const timeoutRaw = (args as any)?.timeout;
@@ -301,10 +458,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
             ? timeoutParsed
             : 60000; // Default 60 seconds (use comet_poll for long tasks)
         const newChat = (args?.newChat as boolean) || false;
+        const tempChat = (args as any)?.tempChat !== false;
+        const mode = (args as any)?.mode as string | undefined;
+        const agentPolicy = ((args as any)?.agentPolicy as string) || "exit";
+        const reasoning = (args as any)?.reasoning as boolean | undefined;
 
         // Guard: don't accidentally start a new prompt while an agentic run is in-flight.
         const preStatus = await cometAI.getAgentStatus();
-        if (!force && preStatus.status === "working") {
+        const isBusy = preStatus.status === "working" || preStatus.hasStopButton || preStatus.hasLoadingSpinner;
+        if (!force && isBusy) {
           return {
             content: [{
               type: "text",
@@ -331,38 +493,134 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
             );
           });
 
-        // Get fresh URL from browser (not cached state)
-        const urlResult = await cometClient.evaluate('window.location.href');
-        const currentUrl = urlResult.result.value as string;
-        const isOnPerplexity = currentUrl?.includes('perplexity.ai');
+        let isAgentMode = await cometAI.isAgentMode();
 
-        // Start fresh conversation if requested, or navigate if not on Perplexity
-        if (newChat || !isOnPerplexity) {
-          await cometClient.navigate("https://www.perplexity.ai/", true);
-          await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for page load
+        if (isAgentMode && agentPolicy === "exit") {
+          sendProgress("Exiting agent mode…", 2, 100);
+          await cometAI.exitAgentMode();
+          isAgentMode = false;
         }
 
-        // Ensure "隐身" (incognito/temporary) mode is enabled if available.
-        // This reduces interference with the user's normal Perplexity account history.
-        // Policy:
-        // - Force-check on newChat (or when we had to navigate back to Perplexity).
-        // - Otherwise use a short TTL cache to avoid paying UI automation cost every call.
-        try {
-          const forceCheckIncognito = newChat || !isOnPerplexity;
-          const maxAgeMs = forceCheckIncognito ? 0 : 5 * 60 * 1000;
-          sendProgress(
-            forceCheckIncognito
-              ? "Checking incognito (隐身) mode…"
-              : "Checking incognito (隐身) mode (cached)…",
-            5,
-            100
-          );
-          const res = await cometAI.ensureTemporaryChatEnabled(true, { maxAgeMs });
-          if (res.checked && res.changed) {
-            sendProgress("Enabling incognito (隐身) mode…", 8, 100);
+        if (!isAgentMode) {
+          const urlResult = await cometClient.safeEvaluate('window.location.href');
+          const currentUrl = urlResult.result.value as string;
+          const isOnPerplexity = currentUrl?.includes('perplexity.ai');
+
+          if (newChat || !isOnPerplexity) {
+            await cometClient.navigate("https://www.perplexity.ai/", true);
+            await new Promise(resolve => setTimeout(resolve, 2000));
           }
-        } catch {
-          // Best-effort only; continue with the prompt.
+
+          if (mode) {
+            const modeMap: Record<string, string> = {
+              search: "Search",
+              research: "Research",
+              labs: "Labs",
+              learn: "Learn",
+            };
+            const ariaLabel = modeMap[mode];
+            if (ariaLabel) {
+              sendProgress(`Switching to ${mode} mode…`, 3, 100);
+              await cometClient.safeEvaluate(`
+                (() => {
+                  const targetLabel = ${JSON.stringify(ariaLabel)};
+                  const btn = document.querySelector('button[aria-label="' + targetLabel + '"]');
+                  if (btn) { btn.click(); return true; }
+                  const allButtons = document.querySelectorAll('button');
+                  for (const b of allButtons) {
+                    const text = b.innerText.toLowerCase();
+                    if ((text.includes('search') || text.includes('research') ||
+                         text.includes('labs') || text.includes('learn')) && b.querySelector('svg')) {
+                      b.click();
+                      return 'dropdown';
+                    }
+                  }
+                  return false;
+                })()
+              `);
+              await new Promise(resolve => setTimeout(resolve, 300));
+              await cometClient.safeEvaluate(`
+                (() => {
+                  const targetMode = ${JSON.stringify(mode)};
+                  const items = document.querySelectorAll('[role="menuitem"], [role="option"], button');
+                  for (const item of items) {
+                    if (item.innerText.toLowerCase().includes(targetMode)) {
+                      item.click();
+                      return true;
+                    }
+                  }
+                  return false;
+                })()
+              `);
+              await new Promise(resolve => setTimeout(resolve, 200));
+            }
+          }
+
+          try {
+            const forceCheckIncognito = newChat || !isOnPerplexity;
+            const maxAgeMs = forceCheckIncognito ? 0 : 5 * 60 * 1000;
+            sendProgress(
+              forceCheckIncognito
+                ? "Checking incognito (隐身) mode…"
+                : "Checking incognito (隐身) mode (cached)…",
+              5,
+              100
+            );
+            const res = await cometAI.ensureTemporaryChatEnabled(tempChat, { maxAgeMs });
+            if (res.checked && res.changed) {
+              sendProgress(tempChat ? "Enabling incognito (隐身) mode…" : "Disabling incognito (隐身) mode…", 8, 100);
+            }
+          } catch {
+            // Best-effort only; continue with the prompt.
+          }
+
+          if (typeof reasoning === "boolean") {
+            try {
+              sendProgress(`Setting reasoning mode…`, 9, 100);
+              const reasoningResult = await cometAI.setReasoning(reasoning);
+              console.error(`[comet] setReasoning(${reasoning}):`, JSON.stringify(reasoningResult, null, 2));
+            } catch (e) {
+              console.error(`[comet] setReasoning error:`, e);
+            }
+          }
+        } else {
+          sendProgress("Continuing in agent mode…", 5, 100);
+          const tabs = await cometClient.listTabsCategorized();
+          if (tabs.sidecar) {
+            await cometClient.connect(tabs.sidecar.id);
+            await new Promise((r) => setTimeout(r, 300));
+          }
+        }
+
+        const attachments = (args as { attachments?: string[] })?.attachments;
+        if (attachments && attachments.length > 0) {
+          sendProgress(`Uploading ${attachments.length} file(s)…`, 10, 100);
+          const filePaths = attachments.map((a) => {
+            if (a.startsWith("file://")) {
+              try {
+                return decodeURIComponent(new URL(a).pathname);
+              } catch {
+                return a.replace(/^file:\/\/(localhost)?/, "");
+              }
+            }
+            return a;
+          });
+          const uploadResult = await cometAI.uploadFiles(filePaths);
+          if (!uploadResult.success) {
+            return {
+              content: [{
+                type: "text",
+                text: `File upload failed: ${uploadResult.errors.join(", ")}`,
+              }],
+              isError: true,
+            };
+          }
+          if (uploadResult.errors.length > 0) {
+            sendProgress(`Uploaded ${uploadResult.uploaded} file(s) with warnings: ${uploadResult.errors.join(", ")}`, 15, 100);
+          } else {
+            sendProgress(`Uploaded ${uploadResult.uploaded} file(s)`, 15, 100);
+          }
+          await new Promise((r) => setTimeout(r, 500));
         }
 
         // Send the prompt
@@ -425,12 +683,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
             lastResponseSignature = signature;
           }
 
-          // Since sendPrompt() throws if it can't submit, we can safely return a completed state
-          // even if the text matches the previous response (e.g. repeating the same query).
+          // Only return completed if we've seen the task actually start (working state)
+          // or the response looks different from baseline
           if (
             status.status === "completed" &&
             (candidateLen > 0 || (status.latestResponse || status.response || "").length > 0) &&
-            Date.now() - startTime > 800
+            Date.now() - startTime > 800 &&
+            (sawWorkingState || responseLooksNew)
           ) {
             log("✅ Task completed");
             const { total, slice } = await cometAI.getLatestResponseSlice(0, maxOutputChars);
@@ -528,37 +787,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
         };
       }
 
-      case "comet_temp_chat": {
-        await ensureConnectedToComet();
-        const enable = (args as any)?.enable;
-        const includeRaw = (args as any)?.includeRaw === true;
-
-        if (typeof enable !== "boolean") {
-          const info = await cometAI.inspectTemporaryChat({ includeRaw });
-          const lines = [
-            `Detected: ${info.detected ? "yes" : "no"}`,
-            `Enabled: ${info.enabled === null ? "(unknown)" : info.enabled ? "yes" : "no"}`,
-          ];
-          if (includeRaw && info.debug) {
-            lines.push("", "--- Debug ---", JSON.stringify(info.debug, null, 2));
-          }
-          return { content: [{ type: "text", text: lines.join("\n") }] };
-        }
-
-        const res = await cometAI.setTemporaryChatEnabled(enable, { includeRaw });
-        const lines = [
-          `Requested: ${enable ? "enable" : "disable"}`,
-          `Attempted: ${res.attempted ? "yes" : "no"}`,
-          `Changed: ${res.changed ? "yes" : "no"}`,
-          `Before: ${res.before.enabled === null ? "(unknown)" : res.before.enabled ? "enabled" : "disabled"}`,
-          `After: ${res.after.enabled === null ? "(unknown)" : res.after.enabled ? "enabled" : "disabled"}`,
-        ];
-        if (includeRaw && res.debug) {
-          lines.push("", "--- Debug ---", JSON.stringify(res.debug, null, 2));
-        }
-        return { content: [{ type: "text", text: lines.join("\n") }] };
-      }
-
       case "comet_poll": {
         await ensureConnectedToComet();
         const offsetRaw = (args as any)?.offset;
@@ -566,8 +794,43 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
           ? Math.trunc(Number(offsetRaw))
           : 0;
         const limit = parsePositiveInt((args as any)?.limit) ?? 24000;
+        const includeSettings = !!(args as any)?.includeSettings;
         const status = await cometAI.getAgentStatus();
         let output = `Status: ${status.status.toUpperCase()}\n`;
+
+        if (includeSettings) {
+          const modeResult = await cometClient.safeEvaluate(`
+            (() => {
+              const modes = ['Search', 'Research', 'Labs', 'Learn'];
+              for (const mode of modes) {
+                const btn = document.querySelector('button[aria-label="' + mode + '"]');
+                if (btn && btn.getAttribute('data-state') === 'checked') {
+                  return mode.toLowerCase();
+                }
+              }
+              const dropdownBtn = document.querySelector('button[class*="gap"]');
+              if (dropdownBtn) {
+                const text = dropdownBtn.innerText.toLowerCase();
+                if (text.includes('search')) return 'search';
+                if (text.includes('research')) return 'research';
+                if (text.includes('labs')) return 'labs';
+                if (text.includes('learn')) return 'learn';
+              }
+              return 'search';
+            })()
+          `);
+          const currentMode = modeResult.result.value as string;
+          const tempChatInfo = await cometAI.inspectTemporaryChat();
+          const modelInfo = await cometAI.getModelInfo({ openMenu: false });
+
+          const reasoningInfo = await cometAI.inspectReasoning();
+
+          output += `\n--- Settings ---\n`;
+          output += `Mode: ${currentMode}\n`;
+          output += `TempChat: ${tempChatInfo.enabled === null ? "(unknown)" : tempChatInfo.enabled ? "enabled" : "disabled"}\n`;
+          output += `Model: ${modelInfo.currentModel ?? "(unknown)"}\n`;
+          output += `Reasoning: ${reasoningInfo.detected ? (reasoningInfo.enabled ? "enabled" : "disabled") : "(not available)"}\n`;
+        }
 
         if (status.agentBrowsingUrl) {
           output += `Browsing: ${status.agentBrowsingUrl}\n`;
@@ -612,149 +875,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
       case "comet_screenshot": {
         await ensureConnectedToComet();
+        await pruneScreenshotResources();
         const result = await cometClient.screenshot("png");
+        const entry = await saveScreenshotResource(result.data, "image/png");
+        void server.sendResourceListChanged().catch(() => {});
+        const kb = (entry.size / 1024).toFixed(1);
+        const text = [
+          `Saved screenshot to ${entry.uri}`,
+          `Size: ${kb} KB`,
+          `Captured at ${new Date(entry.createdAt).toISOString()}`,
+          "Use resources/read with this URI to download the file.",
+        ].join("\n");
         return {
-          content: [{ type: "image", data: result.data, mimeType: "image/png" }],
+          content: [
+            { type: "text", text },
+            toResourceLink(entry),
+          ],
         };
       }
 
-      case "comet_mode": {
+      case "comet_list_models": {
         await ensureConnectedToComet();
-        const mode = args?.mode as string | undefined;
-
-        // If no mode provided, show current mode
-        if (!mode) {
-          const result = await cometClient.evaluate(`
-            (() => {
-              // Try button group first (wide screen)
-              const modes = ['Search', 'Research', 'Labs', 'Learn'];
-              for (const mode of modes) {
-                const btn = document.querySelector('button[aria-label="' + mode + '"]');
-                if (btn && btn.getAttribute('data-state') === 'checked') {
-                  return mode.toLowerCase();
-                }
-              }
-              // Try dropdown (narrow screen) - look for the mode selector button
-              const dropdownBtn = document.querySelector('button[class*="gap"]');
-              if (dropdownBtn) {
-                const text = dropdownBtn.innerText.toLowerCase();
-                if (text.includes('search')) return 'search';
-                if (text.includes('research')) return 'research';
-                if (text.includes('labs')) return 'labs';
-                if (text.includes('learn')) return 'learn';
-              }
-              return 'search';
-            })()
-          `);
-
-          const currentMode = result.result.value as string;
-          const descriptions: Record<string, string> = {
-            search: 'Basic web search',
-            research: 'Deep research with comprehensive analysis',
-            labs: 'Analytics, visualizations, and coding',
-            learn: 'Educational content and explanations'
-          };
-
-          let output = `Current mode: ${currentMode}\n\nAvailable modes:\n`;
-          for (const [m, desc] of Object.entries(descriptions)) {
-            const marker = m === currentMode ? "→" : " ";
-            output += `${marker} ${m}: ${desc}\n`;
-          }
-
-          return { content: [{ type: "text", text: output }] };
-        }
-
-        // Switch mode
-        const modeMap: Record<string, string> = {
-          search: "Search",
-          research: "Research",
-          labs: "Labs",
-          learn: "Learn",
-        };
-        const ariaLabel = modeMap[mode];
-        if (!ariaLabel) {
-          return {
-            content: [{ type: "text", text: `Invalid mode: ${mode}. Use: search, research, labs, learn` }],
-            isError: true,
-          };
-        }
-
-        // Navigate to Perplexity first if not there
-        const state = cometClient.currentState;
-        if (!state.currentUrl?.includes("perplexity.ai")) {
-          await cometClient.navigate("https://www.perplexity.ai/", true);
-        }
-
-        // Try both UI patterns: button group (wide) and dropdown (narrow)
-        const result = await cometClient.evaluate(`
-          (() => {
-            // Strategy 1: Direct button (wide screen)
-            const btn = document.querySelector('button[aria-label="${ariaLabel}"]');
-            if (btn) {
-              btn.click();
-              return { success: true, method: 'button' };
-            }
-
-            // Strategy 2: Dropdown menu (narrow screen)
-            // Find and click the dropdown trigger (button with current mode text)
-            const allButtons = document.querySelectorAll('button');
-            for (const b of allButtons) {
-              const text = b.innerText.toLowerCase();
-              if ((text.includes('search') || text.includes('research') ||
-                   text.includes('labs') || text.includes('learn')) &&
-                  b.querySelector('svg')) {
-                b.click();
-                return { success: true, method: 'dropdown-open', needsSelect: true };
-              }
-            }
-
-            return { success: false, error: "Mode selector not found" };
-          })()
-        `);
-
-        const clickResult = result.result.value as { success: boolean; method?: string; needsSelect?: boolean; error?: string };
-
-        if (clickResult.success && clickResult.needsSelect) {
-          // Wait for dropdown to open, then select the mode
-          await new Promise(resolve => setTimeout(resolve, 300));
-          const selectResult = await cometClient.evaluate(`
-            (() => {
-              // Look for dropdown menu items
-              const items = document.querySelectorAll('[role="menuitem"], [role="option"], button');
-              for (const item of items) {
-                if (item.innerText.toLowerCase().includes('${mode}')) {
-                  item.click();
-                  return { success: true };
-                }
-              }
-              return { success: false, error: "Mode option not found in dropdown" };
-            })()
-          `);
-          const selectRes = selectResult.result.value as { success: boolean; error?: string };
-          if (selectRes.success) {
-            return { content: [{ type: "text", text: `Switched to ${mode} mode` }] };
-          } else {
-            return { content: [{ type: "text", text: `Failed: ${selectRes.error}` }], isError: true };
-          }
-        }
-
-        if (clickResult.success) {
-          return { content: [{ type: "text", text: `Switched to ${mode} mode` }] };
-        } else {
-          return {
-            content: [{ type: "text", text: `Failed to switch mode: ${clickResult.error}` }],
-            isError: true,
-          };
-        }
-      }
-
-      case "comet_models": {
-        await ensureConnectedToComet();
-        const openMenu = (args as any)?.openMenu === true;
-        const includeRaw = (args as any)?.includeRaw === true;
+        const openMenu = !!(args as any)?.openMenu;
+        const includeRaw = !!(args as any)?.includeRaw;
 
         const info = await cometAI.getModelInfo({ openMenu, includeRaw });
         const lines = [
+          `Mode: ${info.mode}`,
           `Current model: ${info.currentModel ?? "(unknown)"}`,
           `Supports switching: ${info.supportsModelSwitching ? "yes" : "no"}`,
           "",
@@ -764,20 +911,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
             : ["- (none detected)"]),
         ];
 
-        if (includeRaw && info.debug) {
-          lines.push("", "--- Debug ---", JSON.stringify(info.debug, null, 2));
+        if (info.mode === "agent") {
+          lines.push("", "Note: Model switching is not available in agent mode. Use search mode instead.");
+        }
+
+        if (includeRaw) {
+          lines.push("", "--- Debug ---", JSON.stringify(info.debug ?? { error: "debug is undefined" }, null, 2));
         }
 
         return { content: [{ type: "text", text: lines.join("\n") }] };
       }
 
-      case "comet_model": {
+      case "comet_set_model": {
         await ensureConnectedToComet();
         const name = String((args as any)?.name ?? "");
         const includeRaw = (args as any)?.includeRaw === true;
 
         const res = await cometAI.setModel(name);
         const lines = [
+          `Mode: ${res.mode}`,
           `Requested: ${name}`,
           `Changed: ${res.changed ? "yes" : "no"}`,
           `Current model: ${res.currentModel ?? "(unknown)"}`,
@@ -787,6 +939,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
             ? res.availableModels.map((m) => `- ${m}`)
             : ["- (none detected)"]),
         ];
+
+        if (res.mode === "agent") {
+          lines.push("", "Note: Model switching is not available in agent mode. Use search mode instead.");
+        }
 
         if (includeRaw && res.debug) {
           lines.push("", "--- Debug ---", JSON.stringify(res.debug, null, 2));
