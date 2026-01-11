@@ -62,7 +62,7 @@ The MCP server auto-launches Comet with remote debugging when needed.
 | `comet_ask` | Send a prompt and wait for response |
 | `comet_poll` | Check task progress (for long-running tasks) |
 | `comet_stop` | Cancel current task |
-| `comet_connect` | Explicitly connect to Comet (usually auto) |
+| `comet_reset` | Reset to clean state, returns current mode/model |
 
 ### Utilities
 

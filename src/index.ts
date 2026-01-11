@@ -175,9 +175,9 @@ const readScreenshotBlob = async (entry: ScreenshotResourceEntry) => {
 
 const TOOLS: Tool[] = [
   {
-    name: "comet_connect",
+    name: "comet_reset",
     description:
-      "Connect to Comet browser (auto-starts if needed). Returns current state: mode, model, defaultModel. Other tools auto-connect, so this is optional. Warning: resets tabs/state.",
+      "Reset Comet to clean state: closes extra tabs, navigates to Perplexity home, returns current state (mode, model, defaultModel). Use when Comet is in a bad state or before starting fresh.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -395,7 +395,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
   try {
     switch (name) {
-      case "comet_connect": {
+      case "comet_reset": {
         // Auto-start Comet with debug port (will restart if running without it)
         const startResult = await cometClient.startComet();
 
