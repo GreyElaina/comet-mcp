@@ -765,9 +765,9 @@ export class CometAI {
   }> {
     await cometClient.ensureOnPerplexity();
 
-    const openMenu = options?.openMenu === true;
-    const includeRaw = options?.includeRaw === true;
     const inspectAllReasoning = options?.inspectAllReasoning === true;
+    const openMenu = options?.openMenu === true || inspectAllReasoning;
+    const includeRaw = options?.includeRaw === true;
 
     const { mode, hasAgentBrowsing } = await this.detectMode();
     

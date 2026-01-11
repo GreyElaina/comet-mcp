@@ -271,7 +271,7 @@ FORMATTING WARNING:
       type: "object",
       properties: {
         openMenu: { type: "boolean", description: "Attempt to open model selector dropdown (default: false)" },
-        inspectAllReasoning: { type: "boolean", description: "Check reasoning support for each model (slow, requires openMenu=true)" },
+        inspectAllReasoning: { type: "boolean", description: "Check reasoning support for each model (slow, implies openMenu=true)" },
         includeRaw: { type: "boolean", description: "Include debug details (default: false)" },
       },
     },
