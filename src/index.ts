@@ -177,7 +177,7 @@ const TOOLS: Tool[] = [
   {
     name: "comet_connect",
     description:
-      "Connect to Comet browser (auto-starts if needed). Optional: other tools auto-connect if needed. Warning: this may reset tabs/state (use comet_poll if a task is already running).",
+      "Connect to Comet browser (auto-starts if needed). Returns current state: mode, model, defaultModel. Other tools auto-connect, so this is optional. Warning: resets tabs/state.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -418,17 +418,28 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
         if (anyPage) {
           await cometClient.connect(anyPage.id);
-          // Always navigate to Perplexity home for clean state
           await cometClient.navigate("https://www.perplexity.ai/", true);
           await new Promise(resolve => setTimeout(resolve, 1500));
-          return { content: [{ type: "text", text: `${startResult}\nConnected to Perplexity (cleaned ${pageTabs.length - 1} old tabs)` }] };
+        } else {
+          const newTab = await cometClient.newTab("https://www.perplexity.ai/");
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          await cometClient.connect(newTab.id);
         }
 
-        // No tabs at all - create a new one
-        const newTab = await cometClient.newTab("https://www.perplexity.ai/");
-        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for page load
-        await cometClient.connect(newTab.id);
-        return { content: [{ type: "text", text: `${startResult}\nCreated new tab and navigated to Perplexity` }] };
+        const [uiMode, modelInfo] = await Promise.all([
+          cometAI.getPerplexityUIMode().catch(() => null),
+          cometAI.getModelInfo({ openMenu: false }).catch(() => null),
+        ]);
+
+        const info = {
+          status: "connected",
+          mode: uiMode || "unknown",
+          model: modelInfo?.currentModel || "unknown",
+          defaultModel: cometAI.getDefaultModel(),
+          tabsCleaned: pageTabs.length > 1 ? pageTabs.length - 1 : 0,
+        };
+
+        return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
       }
 
       case "comet_ask": {
