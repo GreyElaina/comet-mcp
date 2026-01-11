@@ -271,6 +271,7 @@ FORMATTING WARNING:
       type: "object",
       properties: {
         openMenu: { type: "boolean", description: "Attempt to open model selector dropdown (default: false)" },
+        inspectAllReasoning: { type: "boolean", description: "Check reasoning support for each model (slow, requires openMenu=true)" },
         includeRaw: { type: "boolean", description: "Include debug details (default: false)" },
       },
     },
@@ -892,9 +893,10 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       case "comet_list_models": {
         await ensureConnectedToComet();
         const openMenu = !!(args as any)?.openMenu;
+        const inspectAllReasoning = !!(args as any)?.inspectAllReasoning;
         const includeRaw = !!(args as any)?.includeRaw;
 
-        const info = await cometAI.getModelInfo({ openMenu, includeRaw });
+        const info = await cometAI.getModelInfo({ openMenu, inspectAllReasoning, includeRaw });
         const reasoningStatus = info.reasoningAvailable
           ? (info.reasoningEnabled ? "enabled" : "disabled")
           : "not available";
@@ -905,10 +907,20 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
           `Supports switching: ${info.supportsModelSwitching ? "yes" : "no"}`,
           "",
           "Available models:",
-          ...(info.availableModels.length
-            ? info.availableModels.map((m) => `- ${m}`)
-            : ["- (none detected)"]),
         ];
+
+        if (info.modelReasoningSupport) {
+          for (const m of info.availableModels) {
+            const support = info.modelReasoningSupport[m] ?? "unknown";
+            const tag = support === "available" ? "[R]" : support === "disabled" ? "[r]" : "";
+            lines.push(`- ${m} ${tag}`.trim());
+          }
+          lines.push("", "[R] = reasoning available, [r] = reasoning disabled");
+        } else if (info.availableModels.length) {
+          lines.push(...info.availableModels.map((m) => `- ${m}`));
+        } else {
+          lines.push("- (none detected)");
+        }
 
         if (info.mode === "agent") {
           lines.push("", "Note: Model switching is not available in agent mode. Use search mode instead.");

@@ -752,9 +752,11 @@ export class CometAI {
   async getModelInfo(options?: {
     openMenu?: boolean;
     includeRaw?: boolean;
+    inspectAllReasoning?: boolean;
   }): Promise<{
     currentModel: string | null;
     availableModels: string[];
+    modelReasoningSupport?: Record<string, "none" | "disabled" | "available">;
     supportsModelSwitching: boolean;
     reasoningAvailable: boolean;
     reasoningEnabled: boolean | null;
@@ -765,6 +767,7 @@ export class CometAI {
 
     const openMenu = options?.openMenu === true;
     const includeRaw = options?.includeRaw === true;
+    const inspectAllReasoning = options?.inspectAllReasoning === true;
 
     const { mode, hasAgentBrowsing } = await this.detectMode();
     
@@ -932,6 +935,78 @@ export class CometAI {
     let reasoningInfo = { detected: false, enabled: null as boolean | null };
     if (openMenu && baseValue.opened) {
       reasoningInfo = await this.detectReasoningToggle();
+    }
+
+    let modelReasoningSupport: Record<string, "none" | "disabled" | "available"> | undefined;
+    if (inspectAllReasoning && openMenu && baseValue.opened && availableModels.length > 0) {
+      modelReasoningSupport = {};
+      const originalModel = baseValue.currentModel;
+      
+      for (const modelName of availableModels) {
+        const clickResult = await cometClient.safeEvaluate(`
+          (() => {
+            const items = document.querySelectorAll('[role=menu] [role=menuitem]');
+            for (const item of items) {
+              const nameEl = item.querySelector('.flex-1 span');
+              if (nameEl?.textContent?.trim() === ${JSON.stringify(modelName)}) {
+                item.click();
+                return true;
+              }
+            }
+            return false;
+          })()
+        `);
+        
+        if (!clickResult.result?.value) {
+          modelReasoningSupport[modelName] = "none";
+          continue;
+        }
+        
+        await new Promise(r => setTimeout(r, 300));
+        await this.openModelMenu();
+        await new Promise(r => setTimeout(r, 300));
+        
+        const toggleResult = await cometClient.safeEvaluate(`
+          (() => {
+            const items = document.querySelectorAll('[role=menu] [role=menuitem]');
+            for (const item of items) {
+              const toggle = item.querySelector('button[role=switch]');
+              if (toggle) {
+                return { found: true, disabled: toggle.disabled };
+              }
+            }
+            return { found: false };
+          })()
+        `);
+        
+        const toggleInfo = toggleResult.result?.value as { found: boolean; disabled?: boolean } | null;
+        if (!toggleInfo?.found) {
+          modelReasoningSupport[modelName] = "none";
+        } else if (toggleInfo.disabled) {
+          modelReasoningSupport[modelName] = "disabled";
+        } else {
+          modelReasoningSupport[modelName] = "available";
+        }
+      }
+      
+      if (originalModel) {
+        await cometClient.safeEvaluate(`
+          (() => {
+            const items = document.querySelectorAll('[role=menu] [role=menuitem]');
+            for (const item of items) {
+              const nameEl = item.querySelector('.flex-1 span');
+              if (nameEl?.textContent?.trim() === ${JSON.stringify(originalModel)}) {
+                item.click();
+                return true;
+              }
+            }
+            return false;
+          })()
+        `);
+      }
+    }
+
+    if (openMenu && baseValue.opened) {
       await cometClient.safeEvaluate(`
         (() => {
           try {
@@ -945,6 +1020,7 @@ export class CometAI {
     return {
       currentModel: baseValue.currentModel,
       availableModels,
+      modelReasoningSupport,
       supportsModelSwitching: openMenu ? baseValue.opened && availableModels.length > 0 : false,
       reasoningAvailable: reasoningInfo.detected,
       reasoningEnabled: reasoningInfo.enabled,
