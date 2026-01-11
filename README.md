@@ -70,7 +70,7 @@ The MCP server auto-launches Comet with remote debugging when needed.
 |------|-------------|
 | `comet_screenshot` | Capture current page as MCP resource |
 | `comet_list_models` | List available Perplexity models |
-| `comet_set_model` | Switch Perplexity model |
+| `comet_set_model` | Set default Perplexity model for subsequent asks |
 | `comet_debug` | Dump CDP/UI status for debugging |
 
 ## `comet_ask` Parameters
@@ -78,7 +78,8 @@ The MCP server auto-launches Comet with remote debugging when needed.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `prompt` | string | *required* | Question or task for Comet |
-| `mode` | string | current | `search`, `research`, `labs`, or `learn` |
+| `mode` | string | current | `search`, `research`, or `studio` |
+| `model` | string | current | Model name (e.g. `gpt-4o`, `claude-sonnet`). Only in search mode |
 | `newChat` | boolean | `false` | Start a fresh conversation |
 | `tempChat` | boolean | `true` | Enable Perplexity incognito mode |
 | `agentPolicy` | string | `exit` | When browsing a website: `exit` returns to search, `continue` keeps browsing |
