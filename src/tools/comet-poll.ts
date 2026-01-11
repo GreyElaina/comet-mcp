@@ -1,0 +1,103 @@
+import { z } from "zod";
+import type { FastMCP } from "fastmcp";
+import { cometClient } from "../cdp-client.js";
+import { cometAI } from "../comet-ai.js";
+import { parsePositiveInt } from "./shared.js";
+
+const schema = z.object({
+  offset: z
+    .number()
+    .optional()
+    .describe("Response slice start (chars). Default: 0"),
+  limit: z
+    .number()
+    .optional()
+    .describe("Response slice length (chars). Default: 24000"),
+  includeSettings: z
+    .boolean()
+    .optional()
+    .describe("Include current session settings (mode, tempChat, model). Default: false"),
+});
+
+const description = `Check agent status and progress (does not start a new task). Call repeatedly to monitor an existing agentic task.`;
+
+export function registerCometPollTool(server: FastMCP) {
+  server.addTool({
+    name: "comet_poll",
+    description,
+    parameters: schema,
+    execute: async (args) => {
+      const offsetRaw = args.offset;
+      const offset =
+        Number.isFinite(Number(offsetRaw)) && Number(offsetRaw) >= 0
+          ? Math.trunc(Number(offsetRaw))
+          : 0;
+      const limit = parsePositiveInt(args.limit) ?? 24000;
+      const includeSettings = !!args.includeSettings;
+
+      const status = await cometAI.getAgentStatus();
+
+      const result: Record<string, unknown> = {
+        status: status.status,
+      };
+
+      if (includeSettings) {
+        const modeResult = await cometClient.safeEvaluate(`
+          (() => {
+            const checked = document.querySelector('button[role="radio"][aria-checked="true"]');
+            if (checked) return checked.getAttribute('value') || 'search';
+            return 'search';
+          })()
+        `);
+        const currentMode = modeResult.result.value as string;
+        const tempChatInfo = await cometAI.inspectTemporaryChat();
+        const modelInfo = await cometAI.getModelInfo({ openMenu: false });
+        const reasoningInfo = await cometAI.inspectReasoning();
+
+        result.settings = {
+          mode: currentMode,
+          tempChat: tempChatInfo.enabled,
+          model: modelInfo.currentModel ?? null,
+          reasoning: reasoningInfo.detected
+            ? reasoningInfo.enabled
+              ? "enabled"
+              : "disabled"
+            : "not available",
+        };
+      }
+
+      if (status.agentBrowsingUrl) {
+        result.agentBrowsingUrl = status.agentBrowsingUrl;
+      }
+
+      if (status.steps.length > 0) {
+        result.steps = status.steps;
+      }
+
+      if (status.currentStep && status.status === "working") {
+        result.currentStep = status.currentStep;
+      }
+
+      if (status.status === "completed") {
+        const { total, slice } = await cometAI.getLatestResponseSlice(offset, limit);
+        if (slice) {
+          const start = Math.min(offset, total);
+          const end = Math.min(start + slice.length, total);
+          const hasMore = end < total;
+
+          result.response = {
+            total,
+            slice: { start, end },
+            hasMore,
+            ...(hasMore && { nextOffset: end }),
+            content: slice,
+          };
+        }
+      } else if (status.status === "working" && status.hasStopButton) {
+        result.hint = "Agent is working - use comet_stop to interrupt if needed";
+      }
+
+      return JSON.stringify(result, null, 2);
+    },
+  });
+}

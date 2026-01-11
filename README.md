@@ -73,6 +73,83 @@ The MCP server auto-launches Comet with remote debugging when needed.
 | `comet_set_model` | Set default Perplexity model for subsequent asks |
 | `comet_debug` | Dump CDP/UI status for debugging |
 
+### JSON Output Format
+
+All utility tools return structured JSON for programmatic parsing:
+
+<details>
+<summary><code>comet_poll</code></summary>
+
+```json
+{
+  "status": "working",
+  "settings": { "mode": "search", "tempChat": true, "model": "gpt-4o", "reasoning": "enabled" },
+  "agentBrowsingUrl": "https://example.com",
+  "steps": ["Searching...", "Reading page..."],
+  "currentStep": "Analyzing results",
+  "response": { "total": 5000, "slice": { "start": 0, "end": 5000 }, "hasMore": false, "content": "..." },
+  "hint": "Agent is working - use comet_stop to interrupt if needed"
+}
+```
+</details>
+
+<details>
+<summary><code>comet_list_models</code></summary>
+
+```json
+{
+  "mode": "search",
+  "currentModel": "gpt-4o",
+  "reasoning": { "status": "enabled", "available": true, "enabled": true },
+  "supportsModelSwitching": true,
+  "availableModels": [
+    { "name": "gpt-4o", "reasoning": "available" },
+    { "name": "claude-sonnet", "reasoning": "toggleDisabled" }
+  ]
+}
+```
+</details>
+
+<details>
+<summary><code>comet_set_model</code></summary>
+
+```json
+{
+  "action": "set",
+  "previous": null,
+  "current": "claude-sonnet",
+  "validation": { "status": "valid", "matchedModel": "claude-3.5-sonnet" }
+}
+```
+
+Use `validate: true` to check if model exists in available models (requires Comet connection).
+</details>
+
+<details>
+<summary><code>comet_stop</code></summary>
+
+```json
+{ "stopped": true }
+```
+</details>
+
+<details>
+<summary><code>comet_screenshot</code></summary>
+
+Returns JSON metadata + MCP `resource_link`:
+
+```json
+{
+  "uri": "comet://screenshots/screenshot-1234.png",
+  "name": "screenshot-1234.png",
+  "mimeType": "image/png",
+  "size": 12345,
+  "sizeKB": "12.1",
+  "capturedAt": "2025-01-12T00:00:00.000Z"
+}
+```
+</details>
+
 ## `comet_ask` Parameters
 
 | Parameter | Type | Default | Description |
@@ -111,7 +188,7 @@ When Comet is actively browsing a website (agent mode), you can control behavior
 }
 ```
 
-Supported: `png`, `jpg`, `gif`, `webp`, `pdf`, `txt`, `csv`, `md` (max 25MB each)
+Supports 80+ formats: images, documents (pdf/docx/xlsx/pptx), code files, text, audio, video (max 25MB each)
 
 ## Screenshots & Resources
 

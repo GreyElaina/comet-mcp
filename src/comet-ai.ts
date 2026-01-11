@@ -3,6 +3,8 @@
 
 import { promises as fs } from "fs";
 import path from "path";
+import mime from "mime-types";
+import { Lexer, type Token, type Tokens } from "marked";
 import { cometClient } from "./cdp-client.js";
 import type { CometAIResponse } from "./types.js";
 
@@ -13,6 +15,7 @@ const MAX_FILE_SIZE = 25 * 1024 * 1024;
 const JS_HELPERS = {
   norm: `const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();`,
   normLower: `const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();`,
+  getHref: `const getHref = (u) => u.getAttribute('href') || u.getAttribute('xlink:href') || u.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || '';`,
   isVisible: `const isVisible = (el) => {
     try {
       const r = el.getBoundingClientRect();
@@ -53,13 +56,8 @@ const JS_HELPERS = {
   isCheckVisible: `const isCheckVisible = (root) => {
     try {
       const uses = Array.from(root.querySelectorAll('use'));
-      const findHref = (u) =>
-        u.getAttribute('href') ||
-        u.getAttribute('xlink:href') ||
-        u.getAttributeNS('http://www.w3.org/1999/xlink', 'href') ||
-        '';
       const checkUse = uses.find((u) => {
-        const href = findHref(u);
+        const href = getHref(u);
         return href === '#pplx-icon-check' || href.endsWith('icon-check');
       }) || null;
       if (!checkUse) return false;
@@ -68,11 +66,6 @@ const JS_HELPERS = {
     } catch { return false; }
   };`,
   findStopButton: `const findStopButton = () => {
-    const getHref = (u) =>
-      u.getAttribute('href') ||
-      u.getAttribute('xlink:href') ||
-      u.getAttributeNS('http://www.w3.org/1999/xlink', 'href') ||
-      '';
     const svgBtn = Array.from(document.querySelectorAll('button'))
       .find(btn => {
         if (btn.offsetParent === null || btn.disabled) return false;
@@ -92,23 +85,22 @@ const JS_HELPERS = {
   };`,
 };
 
+// Perplexity's actual accepted file types (from file input accept attribute)
 const SUPPORTED_FILE_EXTENSIONS: Record<string, string[]> = {
-  image: ["png", "jpg", "jpeg", "gif", "webp"],
-  document: ["pdf"],
-  text: ["txt", "csv", "md"],
+  image: ["png", "jpg", "jpeg", "jpe", "jp2", "gif", "bmp", "tiff", "tif", "svg", "webp", "ico", "avif", "heic", "heif"],
+  document: ["pdf", "doc", "docx", "xlsx", "pptx"],
+  text: ["txt", "csv", "md", "markdown", "text", "log", "ini", "conf", "config", "xml", "json", "yaml", "yml", "toml"],
+  code: [
+    "js", "jsx", "ts", "tsx", "py", "rb", "go", "rs", "java", "kt", "kts", "scala", "swift", "dart",
+    "c", "cpp", "cxx", "h", "hpp", "cs", "m", "php", "pl", "pm", "t", "r", "R", "rmd",
+    "lua", "sh", "bash", "zsh", "ksh", "fish", "bat", "sql", "html", "htm", "css", "less",
+    "coffee", "diff", "tex", "latex", "ipynb", "in",
+  ],
+  audio: ["mp3", "wav", "aiff", "ogg", "flac"],
+  video: ["mp4", "mpeg", "mpg", "mov", "avi", "flv", "webm", "wmv", "3gp"],
 };
 
-const EXTENSION_TO_MIME: Record<string, string> = {
-  png: "image/png",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  gif: "image/gif",
-  webp: "image/webp",
-  pdf: "application/pdf",
-  txt: "text/plain",
-  csv: "text/csv",
-  md: "text/markdown",
-};
+
 
 export interface FileValidationResult {
   valid: boolean;
@@ -133,8 +125,8 @@ const SELECTORS = {
     'textarea',
     'input[type="text"]',
   ],
-  // Response/output selectors for Perplexity (only prose works as of 2025-01)
   response: [
+    '[id^="markdown-content"]',
     '[class*="prose"]',
   ],
   // Loading indicator selectors
@@ -278,6 +270,7 @@ export class CometAI {
     // Structural approach: find incognito toggle by switch or checkmark
     const result = await cometClient.safeEvaluate(`
       (() => {
+        ${JS_HELPERS.getHref}
         ${JS_HELPERS.isVisible}
         ${JS_HELPERS.isCheckVisible}
 
@@ -623,106 +616,75 @@ export class CometAI {
     return loadingSelector !== null;
   }
 
-  /**
-   * Wait for Comet AI to finish responding
-   */
-  async waitForResponse(timeout: number = 30000): Promise<CometAIResponse> {
-    const startTime = Date.now();
-    let lastText = "";
-    let stableCount = 0;
+  async ask(
+    prompt: string,
+    options?: number | { timeout?: number; stripCitations?: boolean }
+  ): Promise<CometAIResponse> {
+    const timeout = typeof options === 'number' ? options : (options?.timeout ?? 30000);
+    const stripCitations = typeof options === 'object' ? options.stripCitations : false;
 
-    // Wait for page to start loading response
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    const baseline = await this.getAgentStatus();
+    const baselineLen = baseline.latestResponseLength || baseline.responseLength || 0;
+    const baselineTail = baseline.latestResponseTail || 
+      (baseline.latestResponse || baseline.response || "").slice(-2000);
 
-    while (Date.now() - startTime < timeout) {
-      // Get response text from Perplexity's answer area
-      const result = await cometClient.safeEvaluate(`
-        (() => {
-          // Look for prose elements and get the last one (most recent response)
-          const allEls = Array.from(document.querySelectorAll('[class*="prose"]'));
-          // Filter out nested elements (e.g., LI items inside a prose DIV)
-          const topLevelEls = allEls.filter(el => 
-            !allEls.some(other => other !== el && other.contains(el))
-          );
-          if (topLevelEls.length > 0) {
-            return topLevelEls[topLevelEls.length - 1].innerText;
-          }
-          return "";
-        })()
-      `);
-
-      const currentText = (result.result.value as string) || "";
-
-      // Check if response has stabilized (text same for 3 consecutive checks)
-      if (currentText.length > 10 && currentText === lastText) {
-        stableCount++;
-        if (stableCount >= 3) {
-          this.lastResponseText = currentText;
-          return {
-            text: currentText,
-            complete: true,
-            timestamp: Date.now(),
-          };
-        }
-      } else {
-        stableCount = 0;
-      }
-
-      lastText = currentText;
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-
-    // Timeout - return whatever we have
-    return {
-      text: lastText || "No response detected within timeout",
-      complete: false,
-      timestamp: Date.now(),
-    };
-  }
-
-  /**
-   * Send prompt and wait for response
-   */
-  async ask(prompt: string, timeout: number = 30000): Promise<CometAIResponse> {
     await this.sendPrompt(prompt);
 
-    // Wait a bit for the response to start
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const startTime = Date.now();
+    let sawWorkingState = false;
+    let lastSignature = "";
+    let stableCount = 0;
 
-    return this.waitForResponse(timeout);
-  }
+    while (Date.now() - startTime < timeout) {
+      const elapsed = Date.now() - startTime;
+      const pollMs = elapsed < 2500 ? 500 : elapsed < 8000 ? 1200 : 2000;
+      await new Promise(r => setTimeout(r, pollMs));
 
-  /**
-   * Get the current visible response text (returns latest response in multi-turn conversations)
-   */
-  async getCurrentResponse(): Promise<string> {
-    await cometClient.ensureOnPerplexity();
+      const status = await this.getAgentStatus();
 
-    const result = await cometClient.safeEvaluate(`
-      (() => {
-        ${JS_HELPERS.pickLatestResponse(JSON.stringify(SELECTORS.response))}
-        return pickLatestResponse();
-      })()
-    `);
+      const currentLen = status.latestResponseLength || status.responseLength || 0;
+      const currentTail = status.latestResponseTail ||
+        (status.latestResponse || status.response || "").slice(-2000);
+      const responseLooksNew = currentLen > 0 && 
+        (currentLen !== baselineLen || currentTail !== baselineTail);
 
-    const text = result.result.value as string;
-    if (text && text.length > 0) {
-      return text;
+      const signature = `${currentLen}:${currentTail}`;
+      if (responseLooksNew) {
+        stableCount = signature === lastSignature ? stableCount + 1 : 0;
+        lastSignature = signature;
+      }
+
+      if (status.status === "working" || status.hasStopButton || status.hasLoadingSpinner) {
+        sawWorkingState = true;
+      }
+
+      const hasResponse = currentLen > 0 || (status.latestResponse || status.response || "").length > 0;
+      const completionReady = elapsed > 800 && (sawWorkingState || responseLooksNew);
+      
+      if (status.status === "completed" && hasResponse && completionReady) {
+        const text = await this.getResponseMarkdown({ stripCitations });
+        this.lastResponseText = text;
+        return { text, complete: true, timestamp: Date.now() };
+      }
+
+      // Fallback: response stable for 3 polls without loading indicators
+      if (responseLooksNew && stableCount >= 3 && !status.hasStopButton && !status.hasLoadingSpinner) {
+        const text = await this.getResponseMarkdown({ stripCitations });
+        this.lastResponseText = text;
+        return { text, complete: true, timestamp: Date.now() };
+      }
+
+      // Edge case: completed shown but never saw working (quick response)
+      if (status.status === "completed" && !sawWorkingState && elapsed > 10000 && responseLooksNew) {
+        const text = await this.getResponseMarkdown({ stripCitations });
+        this.lastResponseText = text;
+        return { text, complete: true, timestamp: Date.now() };
+      }
     }
 
-    // Fallback: try to get text from main content area
-    const fallbackResult = await cometClient.safeEvaluate(`
-      (() => {
-        const main = document.querySelector('main');
-        if (!main) return document.body.innerText.substring(0, 5000);
-        // Try to find the content area, excluding sidebar/navigation
-        const content = main.querySelector('[class*="grow"]') || main;
-        return content.innerText.substring(0, 5000);
-      })()
-    `);
-    return (fallbackResult.result.value as string) || "";
+    const text = await this.getResponseMarkdown({ stripCitations });
+    return { text: text || "No response detected within timeout", complete: false, timestamp: Date.now() };
   }
-
   async getLatestResponseSlice(
     offset: number = 0,
     limit: number = 24000
@@ -749,6 +711,112 @@ export class CometAI {
     return result.result.value as { total: number; slice: string };
   }
 
+  async getResponseMarkdown(options?: { stripCitations?: boolean }): Promise<string> {
+    const result = await cometClient.safeEvaluate(`
+      (async () => {
+        const copyBtn = (() => {
+          const getHref = (u) => u.href?.baseVal || u.getAttributeNS('http://www.w3.org/1999/xlink', 'href') || '';
+          const uses = document.querySelectorAll('svg use');
+          for (const u of uses) {
+            if (!getHref(u).includes('copy')) continue;
+            const btn = u.closest('button');
+            if (!btn) continue;
+            const siblings = btn.parentElement?.querySelectorAll('svg use') || [];
+            const hrefs = Array.from(siblings).map(s => getHref(s));
+            if (hrefs.some(h => h.includes('share')) && hrefs.some(h => h.includes('download'))) {
+              return btn;
+            }
+          }
+          return null;
+        })();
+        if (!copyBtn) return { ok: false, error: 'copy button not found' };
+        
+        let captured = null;
+        const origWriteText = navigator.clipboard.writeText?.bind(navigator.clipboard);
+        const origWrite = navigator.clipboard.write?.bind(navigator.clipboard);
+        
+        if (origWriteText) {
+          navigator.clipboard.writeText = (text) => { captured = text; return origWriteText(text); };
+        }
+        if (origWrite) {
+          navigator.clipboard.write = async (data) => {
+            for (const item of data) {
+              if (item.types.includes('text/plain')) {
+                const blob = await item.getType('text/plain');
+                captured = await blob.text();
+                break;
+              }
+            }
+            return origWrite(data);
+          };
+        }
+        
+        try {
+          copyBtn.click();
+          await new Promise(r => setTimeout(r, 500));
+        } finally {
+          if (origWriteText) navigator.clipboard.writeText = origWriteText;
+          if (origWrite) navigator.clipboard.write = origWrite;
+        }
+        
+        return { ok: true, markdown: captured || '' };
+      })()
+    `);
+
+    const value = result.result?.value as { ok: boolean; markdown?: string; error?: string } | null;
+    let markdown = value?.ok && value.markdown ? value.markdown : (await this.getLatestResponseSlice(0, 50000)).slice;
+    
+    if (options?.stripCitations) {
+      markdown = this.stripCitations(markdown);
+    }
+    return markdown;
+  }
+
+  private stripCitations(text: string): string {
+    const isCitationLink = (t: Token) => t.type === 'link' && /^\d+$/.test((t as Tokens.Link).text);
+    const removeCiteMarkers = (s: string) => s.replace(/\[\d+\]/g, '');
+
+    const processToken = (token: Token): string => {
+      if (token.type === 'code') {
+        const t = token as Tokens.Code;
+        return '```' + (t.lang || '') + '\n' + t.text + '\n```';
+      }
+      if (token.type === 'codespan') {
+        return '`' + (token as Tokens.Codespan).text + '`';
+      }
+      if (isCitationLink(token)) {
+        return '';
+      }
+      if ('tokens' in token && Array.isArray(token.tokens)) {
+        const inner = (token.tokens as Token[]).filter(t => !isCitationLink(t)).map(processToken).join('');
+        if (token.type === 'paragraph') return inner + '\n\n';
+        if (token.type === 'heading') return '#'.repeat((token as Tokens.Heading).depth) + ' ' + inner + '\n\n';
+        return inner;
+      }
+      if (token.type === 'text') {
+        return removeCiteMarkers((token as Tokens.Text).text);
+      }
+      if (token.type === 'space') {
+        return (token as Tokens.Space).raw;
+      }
+      if ('raw' in token) {
+        return removeCiteMarkers(token.raw as string);
+      }
+      return '';
+    };
+
+    try {
+      const tokens = new Lexer().lex(text);
+      return tokens.map(processToken).join('')
+        .replace(/\n{3,}/g, '\n\n')
+        .replace(/\n+$/g, '\n');
+    } catch {
+      return removeCiteMarkers(text)
+        .replace(/\n{3,}/g, '\n\n')
+        .replace(/\n+$/g, '\n');
+    }
+  }
+
   async getModelInfo(options?: {
     openMenu?: boolean;
     includeRaw?: boolean;
@@ -756,7 +824,7 @@ export class CometAI {
   }): Promise<{
     currentModel: string | null;
     availableModels: string[];
-    modelReasoningSupport?: Record<string, "none" | "disabled" | "available">;
+    modelReasoningSupport?: Record<string, "none" | "toggleDisabled" | "available">;
     supportsModelSwitching: boolean;
     reasoningAvailable: boolean;
     reasoningEnabled: boolean | null;
@@ -800,15 +868,12 @@ export class CometAI {
 
     const base = await cometClient.safeEvaluate(`
       (() => {
-        const cpuUse = Array.from(document.querySelectorAll('use')).find(u => 
-          u.getAttribute('xlink:href')?.includes('cpu') && 
-          u.closest('button')?.getAttribute('aria-haspopup') !== 'dialog'
-        );
-        const trigger = cpuUse?.closest('button') || null;
+        ${this.MODEL_TRIGGER_JS}
+        const trigger = getModelTrigger();
         const currentModel = trigger?.getAttribute('aria-label') || null;
 
         const debug = { 
-          hasCpuIcon: !!cpuUse, 
+          hasTrigger: !!trigger, 
           triggerAria: currentModel,
           triggerHaspopup: trigger?.getAttribute('aria-haspopup') 
         };
@@ -875,17 +940,14 @@ export class CometAI {
             }
           };
           
+          ${this.MODEL_TRIGGER_JS}
           const diagnostics = {
             menuCount: 0,
             menuitemCount: 0,
             triggerDataState: null,
           };
           
-          const cpuUse = Array.from(document.querySelectorAll('use')).find(u => 
-            u.getAttribute('xlink:href')?.includes('cpu') && 
-            u.closest('button')?.getAttribute('aria-haspopup') !== 'dialog'
-          );
-          const triggerButton = cpuUse?.closest('button');
+          const triggerButton = getModelTrigger();
           if (triggerButton) {
             diagnostics.triggerDataState = triggerButton.getAttribute('data-state');
           }
@@ -898,6 +960,7 @@ export class CometAI {
           
           for (const item of menuItems) {
             if (!isVisible(item)) continue;
+            if (item.querySelector('[role="switch"]')) continue;
             const nameEl = item.querySelector('.flex-1 span');
             const name = nameEl?.textContent?.trim();
             if (!name) continue;
@@ -937,84 +1000,54 @@ export class CometAI {
       reasoningInfo = await this.detectReasoningToggle();
     }
 
-    let modelReasoningSupport: Record<string, "none" | "disabled" | "available"> | undefined;
+    let modelReasoningSupport: Record<string, "none" | "toggleDisabled" | "available"> | undefined;
     if (inspectAllReasoning && openMenu && baseValue.opened && availableModels.length > 0) {
       modelReasoningSupport = {};
       const originalModel = baseValue.currentModel;
       
       for (const modelName of availableModels) {
-        const clickResult = await cometClient.safeEvaluate(`
-          (() => {
-            const items = document.querySelectorAll('[role=menu] [role=menuitem]');
-            for (const item of items) {
-              const nameEl = item.querySelector('.flex-1 span');
-              if (nameEl?.textContent?.trim() === ${JSON.stringify(modelName)}) {
-                item.click();
-                return true;
-              }
-            }
-            return false;
-          })()
-        `);
+        if (!await this.openModelMenu()) {
+          await new Promise(r => setTimeout(r, 200));
+          if (!await this.openModelMenu()) continue;
+        }
         
-        if (!clickResult.result?.value) {
+        if (!await this.selectModelInMenu(modelName)) {
+          continue;
+        }
+        
+        await new Promise(r => setTimeout(r, 200));
+        
+        if (!await this.openModelMenu()) {
           modelReasoningSupport[modelName] = "none";
           continue;
         }
         
-        await new Promise(r => setTimeout(r, 300));
-        await this.openModelMenu();
-        await new Promise(r => setTimeout(r, 300));
+        const { success, finalState } = await this.waitForMenu(
+          s => s.open && s.itemCount > 0,
+          800,
+          true
+        );
         
-        const toggleResult = await cometClient.safeEvaluate(`
-          (() => {
-            const items = document.querySelectorAll('[role=menu] [role=menuitem]');
-            for (const item of items) {
-              const toggle = item.querySelector('button[role=switch]');
-              if (toggle) {
-                return { found: true, disabled: toggle.disabled };
-              }
-            }
-            return { found: false };
-          })()
-        `);
-        
-        const toggleInfo = toggleResult.result?.value as { found: boolean; disabled?: boolean } | null;
-        if (!toggleInfo?.found) {
+        if (!success || !finalState.open) {
           modelReasoningSupport[modelName] = "none";
-        } else if (toggleInfo.disabled) {
-          modelReasoningSupport[modelName] = "disabled";
+        } else if (!finalState.hasToggle) {
+          modelReasoningSupport[modelName] = "none";
+        } else if (finalState.toggleDisabled) {
+          modelReasoningSupport[modelName] = "toggleDisabled";
         } else {
           modelReasoningSupport[modelName] = "available";
         }
       }
       
       if (originalModel) {
-        await cometClient.safeEvaluate(`
-          (() => {
-            const items = document.querySelectorAll('[role=menu] [role=menuitem]');
-            for (const item of items) {
-              const nameEl = item.querySelector('.flex-1 span');
-              if (nameEl?.textContent?.trim() === ${JSON.stringify(originalModel)}) {
-                item.click();
-                return true;
-              }
-            }
-            return false;
-          })()
-        `);
+        await this.openModelMenu();
+        await this.selectModelInMenu(originalModel);
       }
+      await this.closeModelMenu();
     }
 
-    if (openMenu && baseValue.opened) {
-      await cometClient.safeEvaluate(`
-        (() => {
-          try {
-            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-          } catch {}
-          return true;
-        })()
-      `);
+    if (openMenu) {
+      await this.closeModelMenu();
     }
 
     return {
@@ -1036,27 +1069,138 @@ export class CometAI {
     };
   }
 
-  private async openModelMenu(): Promise<boolean> {
-    const openResult = await cometClient.safeEvaluate(`
-      (() => {
-        const cpuUse = Array.from(document.querySelectorAll('use')).find(u => 
-          u.getAttribute('xlink:href')?.includes('cpu') && 
-          u.closest('button')?.getAttribute('aria-haspopup') !== 'dialog'
-        );
-        const btn = cpuUse?.closest('button');
-        if (btn) {
-          btn.click();
-          return { clicked: true, aria: btn.getAttribute('aria-label') };
+  private readonly MODEL_TRIGGER_JS = `
+    const getModelTrigger = () => Array.from(document.querySelectorAll('use'))
+      .find(u => u.getAttribute('xlink:href')?.includes('cpu') && u.closest('button')?.getAttribute('aria-haspopup') !== 'dialog')
+      ?.closest('button') || null;
+  `;
+
+  private readonly MENU_JS = `
+    ${this.MODEL_TRIGGER_JS}
+    const getModelMenuState = () => {
+      const trigger = getModelTrigger();
+      if (!trigger) return { open: false, itemCount: 0, hasToggle: false, toggleDisabled: null };
+      
+      const expanded = trigger.getAttribute('aria-expanded') === 'true' || trigger.getAttribute('data-state') === 'open';
+      const menuId = trigger.getAttribute('aria-controls');
+      let menu = menuId ? document.getElementById(menuId) : null;
+      if (!menu) menu = document.querySelector('[role="menu"]');
+      if (!menu) return { open: false, itemCount: 0, hasToggle: false, toggleDisabled: null };
+      
+      const rect = menu.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return { open: expanded, itemCount: 0, hasToggle: false, toggleDisabled: null };
+      
+      const items = Array.from(menu.querySelectorAll('[role="menuitem"]'));
+      const visibleItems = items.filter(i => {
+        const r = i.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      
+      let hasToggle = false;
+      let toggleDisabled = null;
+      for (const item of visibleItems) {
+        const toggle = item.querySelector('button[role="switch"], [role="switch"]');
+        if (toggle) {
+          hasToggle = true;
+          toggleDisabled = toggle.disabled || toggle.getAttribute('aria-disabled') === 'true';
+          break;
         }
-        return { clicked: false };
+      }
+      return { open: visibleItems.length > 0, itemCount: visibleItems.length, hasToggle, toggleDisabled };
+    };
+  `;
+
+  private async getMenuState(): Promise<{ open: boolean; itemCount: number; hasToggle: boolean; toggleDisabled: boolean | null }> {
+    const result = await cometClient.safeEvaluate(`(() => { ${this.MENU_JS} return getModelMenuState(); })()`);
+    return (result.result?.value as any) ?? { open: false, itemCount: 0, hasToggle: false, toggleDisabled: null };
+  }
+
+  private async waitForMenu(
+    predicate: (state: { open: boolean; itemCount: number; hasToggle: boolean; toggleDisabled: boolean | null }) => boolean,
+    timeoutMs = 1500,
+    requireToggleStable = false
+  ): Promise<{ success: boolean; finalState: { open: boolean; itemCount: number; hasToggle: boolean; toggleDisabled: boolean | null } }> {
+    const start = Date.now();
+    let stableCount = 0;
+    let lastState = { open: false, itemCount: -1, hasToggle: false, toggleDisabled: null as boolean | null };
+
+    while (Date.now() - start < timeoutMs) {
+      const state = await this.getMenuState();
+      const matches = predicate(state);
+      const baseStable = state.open === lastState.open && state.itemCount === lastState.itemCount;
+      const toggleStable = !requireToggleStable || state.hasToggle === lastState.hasToggle;
+      const stable = baseStable && toggleStable;
+      
+      if (matches && stable) stableCount++;
+      else stableCount = 0;
+      
+      lastState = state;
+      if (stableCount >= 2) return { success: true, finalState: state };
+      await new Promise(r => setTimeout(r, 60));
+    }
+    return { success: false, finalState: lastState };
+  }
+
+  private async closeModelMenu(): Promise<boolean> {
+    const { success } = await this.waitForMenu(s => !s.open, 200);
+    if (success) return true;
+
+    for (let i = 0; i < 2; i++) {
+      await cometClient.safeEvaluate(`
+        (() => {
+          document.body.click();
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          document.querySelector('[role="menu"]')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        })()
+      `);
+      const { success } = await this.waitForMenu(s => !s.open, 400);
+      if (success) return true;
+    }
+    return false;
+  }
+
+  private async openModelMenu(): Promise<boolean> {
+    const initial = await this.getMenuState();
+    if (initial.open && initial.itemCount > 0) return true;
+    
+    if (initial.open && initial.itemCount === 0) {
+      const { success } = await this.waitForMenu(s => s.open && s.itemCount > 0, 500);
+      if (success) return true;
+    }
+
+    for (let i = 0; i < 3; i++) {
+      const clicked = await cometClient.safeEvaluate(`
+        (() => {
+          ${this.MODEL_TRIGGER_JS}
+          const btn = getModelTrigger();
+          if (btn) { btn.click(); return true; }
+          return false;
+        })()
+      `);
+      if (!clicked.result?.value) return false;
+      const { success } = await this.waitForMenu(s => s.open && s.itemCount > 0, 800);
+      if (success) return true;
+    }
+    return false;
+  }
+
+  private async selectModelInMenu(modelName: string): Promise<boolean> {
+    const result = await cometClient.safeEvaluate(`
+      (() => {
+        ${this.MENU_JS}
+        const items = document.querySelectorAll('[role="menu"] [role="menuitem"]');
+        for (const item of items) {
+          const nameEl = item.querySelector('.flex-1 span');
+          const text = nameEl?.textContent?.trim() || item.innerText?.split('\\n')[0]?.trim();
+          if (text === ${JSON.stringify(modelName)}) {
+            item.click();
+            return true;
+          }
+        }
+        return false;
       })()
     `);
-    const value = openResult.result?.value as { clicked: boolean; aria?: string } | undefined;
-    if (openResult.exceptionDetails || !value?.clicked) {
-      return false;
-    }
-    await new Promise((r) => setTimeout(r, 300));
-    return true;
+    return result.result?.value === true;
   }
 
   private async detectReasoningToggle(): Promise<{ detected: boolean; enabled: boolean | null }> {
@@ -1308,11 +1452,8 @@ export class CometAI {
     
     const openMenuResult = await cometClient.safeEvaluate(`
       (() => {
-        const cpuUse = Array.from(document.querySelectorAll('use')).find(u => 
-          u.getAttribute('xlink:href')?.includes('cpu') && 
-          u.closest('button')?.getAttribute('aria-haspopup') !== 'dialog'
-        );
-        const btn = cpuUse?.closest('button');
+        ${this.MODEL_TRIGGER_JS}
+        const btn = getModelTrigger();
         if (btn) {
           btn.click();
           return { clicked: true, aria: btn.getAttribute('aria-label') };
@@ -1550,6 +1691,7 @@ export class CometAI {
     const result = await cometClient.safeEvaluate(`
       (() => {
         const want = ${enabled} === true;
+        ${JS_HELPERS.getHref}
         ${JS_HELPERS.isVisible}
         ${JS_HELPERS.isCheckVisible}
 
@@ -1624,37 +1766,37 @@ export class CometAI {
     };
   }
 
-  /**
-   * Clear the current conversation/input
-   */
-  async clearConversation(): Promise<boolean> {
-    await cometClient.ensureOnPerplexity();
+  // /**
+  //  * Clear the current conversation/input
+  //  */
+  // async clearConversation(): Promise<boolean> {
+  //   await cometClient.ensureOnPerplexity();
 
-    const result = await cometClient.safeEvaluate(`
-      (function() {
-        // Multi-language aria-label patterns for "new chat" / "clear" buttons
-        const ariaPatterns = ['Clear', 'New', '清除', '新建', '清空', 'Nouveau', 'Neu', 'Nuevo'];
-        const buttons = document.querySelectorAll('button[aria-label]');
-        for (const btn of buttons) {
-          const label = btn.getAttribute('aria-label') || '';
-          if (ariaPatterns.some(p => label.includes(p))) {
-            btn.click();
-            return true;
-          }
-        }
+  //   const result = await cometClient.safeEvaluate(`
+  //     (function() {
+  //       // Multi-language aria-label patterns for "new chat" / "clear" buttons
+  //       const ariaPatterns = ['Clear', 'New', '清除', '新建', '清空', 'Nouveau', 'Neu', 'Nuevo'];
+  //       const buttons = document.querySelectorAll('button[aria-label]');
+  //       for (const btn of buttons) {
+  //         const label = btn.getAttribute('aria-label') || '';
+  //         if (ariaPatterns.some(p => label.includes(p))) {
+  //           btn.click();
+  //           return true;
+  //         }
+  //       }
         
-        // Fallback: find button with plus icon (commonly used for new chat)
-        const plusBtn = document.querySelector('button svg use[*|href*="plus"]')?.closest('button');
-        if (plusBtn) {
-          plusBtn.click();
-          return true;
-        }
+  //       // Fallback: find button with plus icon (commonly used for new chat)
+  //       const plusBtn = document.querySelector('button svg use[*|href*="plus"]')?.closest('button');
+  //       if (plusBtn) {
+  //         plusBtn.click();
+  //         return true;
+  //       }
         
-        return false;
-      })()
-    `);
-    return result.result.value as boolean;
-  }
+  //       return false;
+  //     })()
+  //   `);
+  //   return result.result.value as boolean;
+  // }
 
   /**
    * Get current agent status and progress (for polling)
@@ -1693,6 +1835,7 @@ export class CometAI {
       (() => {
         const body = document.body.innerText;
 
+        ${JS_HELPERS.getHref}
         ${JS_HELPERS.findStopButton}
         const hasActiveStopButton = findStopButton() !== null;
 
@@ -1745,63 +1888,37 @@ export class CometAI {
           status = 'idle';
         }
 
-        // Extract agent steps
+        // Extract agent steps from DOM structure (more reliable than string matching)
         const steps = [];
-        const stepPatterns = [
-          /Preparing to assist[^\\n]*/g,
-          /Clicking[^\\n]*/g,
-          /Typing:[^\\n]*/g,
-          /Navigating[^\\n]*/g,
-          /Reading[^\\n]*/g,
-          /Searching[^\\n]*/g,
-          /Found[^\\n]*/g
-        ];
-        for (const pattern of stepPatterns) {
-          const matches = body.match(pattern);
-          if (matches) {
-            steps.push(...matches.map(s => s.trim().substring(0, 100)));
+        
+        // 1. Goal descriptions from role="listitem" containers
+        const goalEls = document.querySelectorAll('[role="tabpanel"] [role="listitem"] .text-sm.text-quiet > div');
+        for (const el of goalEls) {
+          const text = (el.textContent || '').trim();
+          if (text && text.length > 0 && text.length < 200) {
+            steps.push(text);
           }
         }
-
-        const currentStep = steps.length > 0 ? steps[steps.length - 1] : '';
+        
+        // 2. Sub-step status texts (搜索中, 正在审核来源, etc.)
+        const subStepEls = document.querySelectorAll('[role="tabpanel"] .mt-1\\\\.5 .text-xs.text-quiet > span');
+        for (const el of subStepEls) {
+          const text = (el.textContent || '').trim();
+          if (text && text.length > 0 && text.length < 100) {
+            steps.push(text);
+          }
+        }
+        
+        // 3. Current step = last element with animation-duration (actively animating)
+        const animatedEls = document.querySelectorAll('[role="tabpanel"] span[style*="animation-duration"]');
+        const currentStep = animatedEls.length > 0 
+          ? (animatedEls[animatedEls.length - 1].textContent || '').trim()
+          : '';
 
         // Extract response for completed status
         let response = '';
         if (status === 'completed') {
-          // Strategy 1: Look for prose elements (main answer content)
-          // Take the LAST one - most recent answer in conversation
           response = latestResponse;
-
-          // Strategy 2: Look for answer section by structure
-          if (!response) {
-            // Find the main content area after "Reviewed X sources"
-            const reviewedMatch = body.match(/Reviewed \\d+ sources?/);
-            if (reviewedMatch) {
-              const startIdx = body.indexOf(reviewedMatch[0]) + reviewedMatch[0].length;
-              const endMarkers = ['Related', 'Ask a follow-up', 'Ask anything', 'Share', 'Copy'];
-              let endIdx = body.length;
-              for (const marker of endMarkers) {
-                const idx = body.indexOf(marker, startIdx);
-                if (idx > startIdx && idx < endIdx) endIdx = idx;
-              }
-              response = body.substring(startIdx, endIdx).trim();
-            }
-          }
-
-          // Strategy 3: Fallback - extract after completion marker
-          if (!response || response.length < 5) {
-            const completionIdx = body.indexOf('steps completed');
-            if (completionIdx > -1) {
-              const afterCompletion = body.substring(completionIdx + 15);
-              const endMarkers = ['Related', 'Ask a follow-up', 'Ask anything', 'Sources'];
-              let endIdx = afterCompletion.length;
-              for (const marker of endMarkers) {
-                const idx = afterCompletion.indexOf(marker);
-                if (idx > 0 && idx < endIdx) endIdx = idx;
-              }
-              response = afterCompletion.substring(0, endIdx).trim();
-            }
-          }
         }
 
         return {
@@ -1875,6 +1992,7 @@ export class CometAI {
 
     const result = await cometClient.safeEvaluate(`
       (() => {
+        ${JS_HELPERS.getHref}
         ${JS_HELPERS.findStopButton}
         const btn = findStopButton();
         if (btn) {
@@ -1945,7 +2063,7 @@ export class CometAI {
 
       return {
         valid: true,
-        mimeType: EXTENSION_TO_MIME[ext],
+        mimeType: mime.lookup(filePath) || "application/octet-stream",
         size: stat.size,
       };
     } catch (err) {
