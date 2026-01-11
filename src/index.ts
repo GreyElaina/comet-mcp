@@ -895,9 +895,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         const includeRaw = !!(args as any)?.includeRaw;
 
         const info = await cometAI.getModelInfo({ openMenu, includeRaw });
+        const reasoningStatus = info.reasoningAvailable
+          ? (info.reasoningEnabled ? "enabled" : "disabled")
+          : "not available";
         const lines = [
           `Mode: ${info.mode}`,
           `Current model: ${info.currentModel ?? "(unknown)"}`,
+          `Reasoning: ${reasoningStatus}`,
           `Supports switching: ${info.supportsModelSwitching ? "yes" : "no"}`,
           "",
           "Available models:",

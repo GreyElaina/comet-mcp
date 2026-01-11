@@ -756,6 +756,8 @@ export class CometAI {
     currentModel: string | null;
     availableModels: string[];
     supportsModelSwitching: boolean;
+    reasoningAvailable: boolean;
+    reasoningEnabled: boolean | null;
     mode: CometMode;
     debug?: unknown;
   }> {
@@ -771,6 +773,8 @@ export class CometAI {
         currentModel: null,
         availableModels: [],
         supportsModelSwitching: false,
+        reasoningAvailable: false,
+        reasoningEnabled: null,
         mode,
         debug: includeRaw ? { mode, hasAgentBrowsing, reason: "Agent mode does not support model switching" } : undefined,
       };
@@ -784,6 +788,8 @@ export class CometAI {
         currentModel: null,
         availableModels: [],
         supportsModelSwitching: false,
+        reasoningAvailable: false,
+        reasoningEnabled: null,
         mode,
         debug: includeRaw ? { mode, uiMode, reason: `Model switching only available in search mode (current: ${uiMode})` } : undefined,
       };
@@ -831,6 +837,8 @@ export class CometAI {
         currentModel: null,
         availableModels: [],
         supportsModelSwitching: false,
+        reasoningAvailable: false,
+        reasoningEnabled: null,
         mode,
         debug: includeRaw
           ? (base.exceptionDetails?.exception?.description || base.exceptionDetails?.text || "evaluate failed")
@@ -921,7 +929,9 @@ export class CometAI {
       }
     }
 
+    let reasoningInfo = { detected: false, enabled: null as boolean | null };
     if (openMenu && baseValue.opened) {
+      reasoningInfo = await this.detectReasoningToggle();
       await cometClient.safeEvaluate(`
         (() => {
           try {
@@ -936,13 +946,16 @@ export class CometAI {
       currentModel: baseValue.currentModel,
       availableModels,
       supportsModelSwitching: openMenu ? baseValue.opened && availableModels.length > 0 : false,
+      reasoningAvailable: reasoningInfo.detected,
+      reasoningEnabled: reasoningInfo.enabled,
       mode,
       debug: includeRaw ? { 
         baseDebug: baseValue.debug ?? null,
         opened: baseValue.opened,
         dataStateBefore: baseValue.dataStateBefore,
         dataStateAfter: baseValue.dataStateAfter,
-        menuDiagnostics: lastDiagnostics 
+        menuDiagnostics: lastDiagnostics,
+        reasoning: reasoningInfo
       } : undefined,
     };
   }
