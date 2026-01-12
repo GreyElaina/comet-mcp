@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
 import {
@@ -6,9 +7,14 @@ import {
   saveScreenshotResource,
   toResourceLink,
 } from "../screenshot-manager.js";
-import { ensureConnectedToComet } from "./shared.js";
+import { sessionManager, SessionError } from "../session-manager.js";
+import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
 
-const schema = z.object({});
+const schema = z.object({
+  session: z.string().optional().describe(
+    "Named session to capture. Default: use focused session or auto-create 'default'."
+  ),
+});
 
 const description = `Capture a screenshot of current page`;
 
@@ -17,8 +23,25 @@ export function registerCometScreenshotTool(server: FastMCP) {
     name: "comet_screenshot",
     description,
     parameters: schema,
-    execute: async () => {
-      await ensureConnectedToComet();
+    execute: async (args) => {
+      let session: SessionState;
+      if (args.session) {
+        if (!sessionManager.validateSessionName(args.session)) {
+          throw new UserError(INVALID_SESSION_NAME_ERROR + args.session);
+        }
+        session = await sessionManager.getOrCreateSession(args.session);
+      } else {
+        session = await sessionManager.resolveFocusedOrDefault();
+      }
+      try {
+        await sessionManager.connectToSession(session.name);
+      } catch (e) {
+        if (e instanceof SessionError) {
+          throw new UserError(e.message);
+        }
+        throw e;
+      }
+      sessionManager.updateSessionActivity(session.name);
 
       await pruneScreenshotResources();
 

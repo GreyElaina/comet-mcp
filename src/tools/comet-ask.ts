@@ -3,7 +3,9 @@ import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
 import { cometAI } from "../comet-ai.js";
-import { ensureConnectedToComet, toTextContent, parsePositiveInt } from "./shared.js";
+import { toTextContent, parsePositiveInt } from "./shared.js";
+import { sessionManager, SessionError } from "../session-manager.js";
+import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
 
 const schema = z.object({
   prompt: z.string().describe(
@@ -45,6 +47,9 @@ const schema = z.object({
   stripCitations: z.boolean().optional().describe(
     "Remove [1][2] markers from response (default: true)."
   ),
+  session: z.string().optional().describe(
+    "Named session to use. Auto-creates if not exists. Default: use focused session or auto-create 'default'."
+  ),
 });
 
 const description = `Send a prompt to Perplexity via Comet and wait for the response. Auto-connects if needed.
@@ -80,7 +85,24 @@ export function registerCometAskTool(server: FastMCP) {
     execute: async (args: CometAskArgs, context: ExecuteContext) => {
       const { reportProgress } = context;
 
-      await ensureConnectedToComet();
+      let session: SessionState;
+      if (args.session) {
+        if (!sessionManager.validateSessionName(args.session)) {
+          throw new UserError(INVALID_SESSION_NAME_ERROR + args.session);
+        }
+        session = await sessionManager.getOrCreateSession(args.session);
+      } else {
+        session = await sessionManager.resolveFocusedOrDefault();
+      }
+      try {
+        await sessionManager.connectToSession(session.name);
+      } catch (e) {
+        if (e instanceof SessionError) {
+          throw new UserError(e.message);
+        }
+        throw e;
+      }
+      sessionManager.updateSessionActivity(session.name);
 
       // Validate prompt
       const prompt = String(args.prompt ?? "").trim();
@@ -181,7 +203,7 @@ export function registerCometAskTool(server: FastMCP) {
         }
 
         // Handle model switching
-        const targetModel = model || cometAI.getDefaultModel();
+        const targetModel = model || sessionManager.getSessionDefaultModel(session.name) || cometAI.getDefaultModel();
         if (targetModel) {
           console.error(`[comet] Checking model: ${targetModel}...`);
           await reportProgress({ progress: 6, total: 100 });
@@ -314,6 +336,7 @@ export function registerCometAskTool(server: FastMCP) {
         ) {
           log("Task completed");
           const markdown = await cometAI.getResponseMarkdown({ stripCitations });
+          sessionManager.setSessionLastResponse(session.name, markdown || "");
           let output = markdown || "Task completed (no response text extracted)";
           if (output.length > maxOutputChars) {
             output = output.slice(0, maxOutputChars) +
@@ -366,6 +389,7 @@ export function registerCometAskTool(server: FastMCP) {
         ) {
           log('Task completed (stable response detected)');
           const markdown = await cometAI.getResponseMarkdown({ stripCitations });
+          sessionManager.setSessionLastResponse(session.name, markdown || "");
           let output = markdown;
           if (output.length > maxOutputChars) {
             output = output.slice(0, maxOutputChars) +
@@ -380,6 +404,7 @@ export function registerCometAskTool(server: FastMCP) {
           if (elapsed > 10000 && responseLooksNew) {
             log('Task completed (quick response)');
             const markdown = await cometAI.getResponseMarkdown({ stripCitations });
+            sessionManager.setSessionLastResponse(session.name, markdown || "");
             let output = markdown || 'Task completed (no response text extracted)';
             if (output.length > maxOutputChars) {
               output = output.slice(0, maxOutputChars) +

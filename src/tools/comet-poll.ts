@@ -1,8 +1,11 @@
 import { z } from "zod";
+import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
 import { cometAI } from "../comet-ai.js";
 import { parsePositiveInt } from "./shared.js";
+import { sessionManager, SessionError } from "../session-manager.js";
+import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
 
 const schema = z.object({
   offset: z
@@ -17,6 +20,9 @@ const schema = z.object({
     .boolean()
     .optional()
     .describe("Include current session settings (mode, tempChat, model). Default: false"),
+  session: z.string().optional().describe(
+    "Named session to poll. Default: use focused session or auto-create 'default'."
+  ),
 });
 
 const description = `Check agent status and progress (does not start a new task). Call repeatedly to monitor an existing agentic task.`;
@@ -27,6 +33,25 @@ export function registerCometPollTool(server: FastMCP) {
     description,
     parameters: schema,
     execute: async (args) => {
+      let session: SessionState;
+      if (args.session) {
+        if (!sessionManager.validateSessionName(args.session)) {
+          throw new UserError(INVALID_SESSION_NAME_ERROR + args.session);
+        }
+        session = await sessionManager.getOrCreateSession(args.session);
+      } else {
+        session = await sessionManager.resolveFocusedOrDefault();
+      }
+      try {
+        await sessionManager.connectToSession(session.name);
+      } catch (e) {
+        if (e instanceof SessionError) {
+          throw new UserError(e.message);
+        }
+        throw e;
+      }
+      sessionManager.updateSessionActivity(session.name);
+
       const offsetRaw = args.offset;
       const offset =
         Number.isFinite(Number(offsetRaw)) && Number(offsetRaw) >= 0

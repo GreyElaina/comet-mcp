@@ -1,4 +1,5 @@
 import { cometClient } from "../cdp-client.js";
+import { SessionState } from "../types.js";
 
 export const chunkText = (text: string, chunkSize = 8000): string[] => {
   if (text.length <= chunkSize) return [text];
@@ -38,7 +39,11 @@ export const isUsableViewport = async (): Promise<boolean> => {
   }
 };
 
-export const ensureConnectedToComet = async (): Promise<string | null> => {
+export const ensureConnectedToComet = async (session?: SessionState): Promise<string | null> => {
+  if (session) {
+    return null;
+  }
+
   if (cometClient.isConnected) {
     if (await isUsableViewport()) return null;
     try {
