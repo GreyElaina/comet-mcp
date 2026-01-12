@@ -17,8 +17,8 @@ export function registerCometSessionFocusTool(server: FastMCP) {
     parameters: schema,
     execute: async (args) => {
       try {
-        sessionManager.focusSession(args.name);
-        await sessionManager.connectToSession(args.name);
+         await sessionManager.connectToSession(args.name);
+         sessionManager.focusSession(args.name);
         
         const model = sessionManager.getSessionDefaultModel(args.name);
         if (model) {

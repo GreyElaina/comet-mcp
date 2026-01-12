@@ -7,6 +7,7 @@ import {
 } from "./types.js";
 
 const PERPLEXITY_URL = "https://www.perplexity.ai/";
+const MAX_RESPONSE_TEXT_SIZE = 50 * 1024; // 50KB
 
 export class SessionError extends Error {
   constructor(message: string) {
@@ -22,6 +23,7 @@ export class SessionError extends Error {
 class SessionManager {
   private sessions: Map<string, SessionState> = new Map();
   private focusedSessionName: string | null = null;
+  private inFlightCreates: Map<string, Promise<SessionState>> = new Map();
 
   // --------------------------------------------------------------------------
   // Validation
@@ -50,21 +52,35 @@ class SessionManager {
       return session;
     }
 
-    const tab: CDPTarget = await cometClient.newTab(PERPLEXITY_URL);
-    const now = Date.now();
-    session = {
-      name,
-      tabId: tab.id,
-      createdAt: now,
-      lastActivity: now,
-      defaultModel: null,
-      lastResponseText: "",
-    };
+    const inFlight = this.inFlightCreates.get(name);
+    if (inFlight) {
+      return inFlight;
+    }
 
-    this.sessions.set(name, session);
-    this.focusedSessionName = name;
+    const createPromise = (async () => {
+      try {
+        const tab: CDPTarget = await cometClient.newTab(PERPLEXITY_URL);
+        const now = Date.now();
+        const newSession: SessionState = {
+          name,
+          tabId: tab.id,
+          createdAt: now,
+          lastActivity: now,
+          defaultModel: null,
+          lastResponseText: "",
+        };
 
-    return session;
+        this.sessions.set(name, newSession);
+        this.focusedSessionName = name;
+
+        return newSession;
+      } finally {
+        this.inFlightCreates.delete(name);
+      }
+    })();
+
+    this.inFlightCreates.set(name, createPromise);
+    return createPromise;
   }
 
   resolveSession(name: string): SessionState {
@@ -146,8 +162,13 @@ class SessionManager {
     const tabExists = targets.some((t) => t.id === session.tabId);
 
     if (!tabExists) {
+      // Auto-cleanup the stale session
+      this.sessions.delete(name);
+      if (this.focusedSessionName === name) {
+        this.focusedSessionName = null;
+      }
       throw new SessionError(
-        `Session '${name}' tab was closed externally.\n\nUse comet_session_destroy({ name: "${name}" }) to clean up, or comet_session_list to see active sessions.`
+        `Session '${name}' tab was closed externally (auto-cleaned).\n\nUse comet_session_list to see active sessions, or comet_ask({ session: "${name}" }) to recreate it.`
       );
     }
   }
@@ -204,12 +225,14 @@ class SessionManager {
     return session?.lastResponseText ?? "";
   }
 
-  setSessionLastResponse(name: string, text: string): void {
-    const session = this.sessions.get(name);
-    if (session) {
-      session.lastResponseText = text;
-    }
-  }
+   setSessionLastResponse(name: string, text: string): void {
+     const session = this.sessions.get(name);
+     if (session) {
+       session.lastResponseText = text.length > MAX_RESPONSE_TEXT_SIZE
+         ? text.slice(0, MAX_RESPONSE_TEXT_SIZE)
+         : text;
+     }
+   }
 
   // --------------------------------------------------------------------------
   // Getters

@@ -32,13 +32,18 @@ export function registerCometResetTool(server: FastMCP) {
       const targets = await cometClient.listTargets();
       const pageTabs = targets.filter((t) => t.type === "page");
 
-      if (pageTabs.length > 1) {
-        for (let i = 1; i < pageTabs.length; i++) {
-          await cometClient.closeTab(pageTabs[i].id).catch(() => {});
-        }
-      }
+       if (pageTabs.length > 1) {
+         for (let i = 1; i < pageTabs.length; i++) {
+           await cometClient.closeTab(pageTabs[i].id).catch(() => {});
+         }
+       }
 
-      const freshTargets = await cometClient.listTargets();
+       // Sync again after closing tabs to remove stale sessions from SessionMap
+       if (!hard && pageTabs.length > 1) {
+         await sessionManager.syncWithBrowser();
+       }
+
+       const freshTargets = await cometClient.listTargets();
       const anyPage = freshTargets.find((t) => t.type === "page");
 
       if (anyPage) {

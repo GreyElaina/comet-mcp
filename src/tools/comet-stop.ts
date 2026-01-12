@@ -19,15 +19,21 @@ export function registerCometStopTool(server: FastMCP) {
     description,
     parameters: schema,
     execute: async (args) => {
-      let session: SessionState;
-      if (args.session) {
-        if (!sessionManager.validateSessionName(args.session)) {
-          throw new UserError(INVALID_SESSION_NAME_ERROR + args.session);
-        }
-        session = await sessionManager.getOrCreateSession(args.session);
-      } else {
-        session = await sessionManager.resolveFocusedOrDefault();
-      }
+       let session: SessionState;
+       if (args.session) {
+         if (!sessionManager.validateSessionName(args.session)) {
+           throw new UserError(INVALID_SESSION_NAME_ERROR + args.session);
+         }
+         const existingSession = sessionManager.getSession(args.session);
+         if (!existingSession) {
+           throw new UserError(
+             `Session '${args.session}' not found.\n\nUse comet_ask({ session: "${args.session}" }) to create it first, or comet_session_list to see active sessions.`
+           );
+         }
+         session = existingSession;
+       } else {
+         session = await sessionManager.resolveFocusedOrDefault();
+       }
       try {
         await sessionManager.connectToSession(session.name);
       } catch (e) {
