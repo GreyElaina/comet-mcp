@@ -6,4 +6,7 @@ export { registerCometDebugTool } from "./comet-debug.js";
 export { registerCometPollTool } from "./comet-poll.js";
 export { registerCometScreenshotTool } from "./comet-screenshot.js";
 export { registerCometListModelsTool } from "./comet-list-models.js";
+export { registerCometSessionFocusTool } from "./comet-session-focus.js";
+export { registerCometSessionDestroyTool } from "./comet-session-destroy.js";
+export { registerCometSessionListTool } from "./comet-session-list.js";
 export * from "./shared.js";

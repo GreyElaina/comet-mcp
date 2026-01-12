@@ -10,6 +10,9 @@ import {
   registerCometListModelsTool,
   registerCometSetModelTool,
   registerCometDebugTool,
+  registerCometSessionFocusTool,
+  registerCometSessionDestroyTool,
+  registerCometSessionListTool,
 } from "./tools/index.js";
 import {
   getScreenshotEntry,
@@ -64,6 +67,9 @@ registerCometScreenshotTool(server);
 registerCometListModelsTool(server);
 registerCometSetModelTool(server);
 registerCometDebugTool(server);
+registerCometSessionFocusTool(server);
+registerCometSessionDestroyTool(server);
+registerCometSessionListTool(server);
 
 server.start({
   transportType: "stdio",
