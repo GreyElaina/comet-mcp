@@ -2,7 +2,6 @@ import { z } from "zod";
 import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
-import { cometAI } from "../comet-ai.js";
 import { toTextContent, parsePositiveInt } from "./shared.js";
 import { sessionManager, SessionError, PERPLEXITY_URL } from "../session-manager.js";
 import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
@@ -133,7 +132,7 @@ export function registerCometAskTool(server: FastMCP) {
       const stripCitations = args.stripCitations !== false;
 
       // Guard: don't accidentally start a new prompt while an agentic run is in-flight
-      const preStatus = await cometAI.getAgentStatus();
+      const preStatus = await session.ai.getAgentStatus();
       const isBusy = preStatus.status === "working" || preStatus.hasStopButton || preStatus.hasLoadingSpinner;
       if (!force && isBusy) {
         throw new UserError(
@@ -145,24 +144,24 @@ export function registerCometAskTool(server: FastMCP) {
 
       const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-      let isAgentMode = await cometAI.isAgentMode();
+      let isAgentMode = await session.ai.isAgentMode();
 
       // Handle agent mode based on policy
       if (isAgentMode && agentPolicy === "exit") {
         console.error("[comet] Exiting agent mode...");
         await reportProgress({ progress: 2, total: 100 });
-        await cometAI.exitAgentMode();
+        await session.ai.exitAgentMode();
         isAgentMode = false;
       }
 
       if (!isAgentMode) {
-        const urlResult = await cometClient.safeEvaluate('window.location.href');
+        const urlResult = await cometClient.safeEvaluate('window.location.href', session.tabId);
         const currentUrl = urlResult.result.value as string;
         const isOnPerplexity = currentUrl?.includes('perplexity.ai');
 
-        const wantsModelSwitch = (model || cometAI.getDefaultModel()) && (!mode || mode === "search");
+        const wantsModelSwitch = (model || session.ai.getDefaultModel()) && (!mode || mode === "search");
         if (newChat || !isOnPerplexity || wantsModelSwitch) {
-          await cometClient.navigate(PERPLEXITY_URL, true);
+          await cometClient.navigate(PERPLEXITY_URL, true, session.tabId);
           await new Promise(resolve => setTimeout(resolve, 2000));
         }
 
@@ -179,7 +178,7 @@ export function registerCometAskTool(server: FastMCP) {
               }
               return false;
             })()
-          `);
+          `, session.tabId);
           await new Promise(resolve => setTimeout(resolve, 300));
         }
 
@@ -193,7 +192,7 @@ export function registerCometAskTool(server: FastMCP) {
               : "[comet] Checking incognito mode (cached)..."
           );
           await reportProgress({ progress: 5, total: 100 });
-          const res = await cometAI.ensureTemporaryChatEnabled(tempChat, { maxAgeMs });
+          const res = await session.ai.ensureTemporaryChatEnabled(tempChat, { maxAgeMs });
           if (res.checked && res.changed) {
             console.error(tempChat ? "[comet] Enabling incognito mode..." : "[comet] Disabling incognito mode...");
             await reportProgress({ progress: 8, total: 100 });
@@ -203,12 +202,12 @@ export function registerCometAskTool(server: FastMCP) {
         }
 
         // Handle model switching
-        const targetModel = model || sessionManager.getSessionDefaultModel(session.name) || cometAI.getDefaultModel();
+        const targetModel = model || session.ai.getDefaultModel();
         if (targetModel) {
           console.error(`[comet] Checking model: ${targetModel}...`);
           await reportProgress({ progress: 6, total: 100 });
           try {
-            const modelResult = await cometAI.ensureModel(targetModel);
+            const modelResult = await session.ai.ensureModel(targetModel);
             if (modelResult.changed) {
               console.error(`[comet] Switched to model: ${modelResult.currentModel}`);
               await reportProgress({ progress: 7, total: 100 });
@@ -225,7 +224,7 @@ export function registerCometAskTool(server: FastMCP) {
           try {
             console.error(`[comet] Setting reasoning mode...`);
             await reportProgress({ progress: 9, total: 100 });
-            const reasoningResult = await cometAI.setReasoning(reasoning);
+            const reasoningResult = await session.ai.setReasoning(reasoning);
             console.error(`[comet] setReasoning(${reasoning}):`, JSON.stringify(reasoningResult, null, 2));
           } catch (e) {
             console.error(`[comet] setReasoning error:`, e);
@@ -234,11 +233,6 @@ export function registerCometAskTool(server: FastMCP) {
       } else {
         console.error("[comet] Continuing in agent mode...");
         await reportProgress({ progress: 5, total: 100 });
-        const tabs = await cometClient.listTabsCategorized();
-        if (tabs.sidecar) {
-          await cometClient.connect(tabs.sidecar.id);
-          await new Promise((r) => setTimeout(r, 300));
-        }
       }
 
       // Handle file attachments
@@ -256,7 +250,7 @@ export function registerCometAskTool(server: FastMCP) {
           }
           return a;
         });
-        const uploadResult = await cometAI.uploadFiles(filePaths);
+        const uploadResult = await session.ai.uploadFiles(filePaths);
         if (!uploadResult.success) {
           throw new UserError(`File upload failed: ${uploadResult.errors.join(", ")}`);
         }
@@ -271,7 +265,7 @@ export function registerCometAskTool(server: FastMCP) {
       }
 
       // Capture baseline before sending prompt
-      const baselineStatus = await cometAI.getAgentStatus();
+      const baselineStatus = await session.ai.getAgentStatus();
       const baselineLen = baselineStatus.latestResponseLength || baselineStatus.responseLength || 0;
       const baselinePageUrl = baselineStatus.pageUrl || "";
       const baselineTail =
@@ -279,7 +273,7 @@ export function registerCometAskTool(server: FastMCP) {
         (baselineStatus.latestResponse || baselineStatus.response || "").slice(-4000);
 
       // Send the prompt
-      await cometAI.sendPrompt(prompt);
+      await session.ai.sendPrompt(prompt);
 
       // Wait for completion with polling
       const startTime = Date.now();
@@ -305,7 +299,7 @@ export function registerCometAskTool(server: FastMCP) {
         const pollMs = elapsedMs < 2500 ? 500 : elapsedMs < 8000 ? 1200 : 2000;
         await sleep(pollMs);
 
-        const status = await cometAI.getAgentStatus();
+        const status = await session.ai.getAgentStatus();
         void reportProgress({
           progress: Date.now() - startTime,
           total: timeout,
@@ -335,7 +329,7 @@ export function registerCometAskTool(server: FastMCP) {
           (sawWorkingState || responseLooksNew)
         ) {
           log("Task completed");
-          const markdown = await cometAI.getResponseMarkdown({ stripCitations });
+          const markdown = await session.ai.getResponseMarkdown({ stripCitations });
           sessionManager.setSessionLastResponse(session.name, markdown || "");
           let output = markdown || "Task completed (no response text extracted)";
           if (output.length > maxOutputChars) {
@@ -388,7 +382,7 @@ export function registerCometAskTool(server: FastMCP) {
           !status.hasLoadingSpinner
         ) {
           log('Task completed (stable response detected)');
-          const markdown = await cometAI.getResponseMarkdown({ stripCitations });
+          const markdown = await session.ai.getResponseMarkdown({ stripCitations });
           sessionManager.setSessionLastResponse(session.name, markdown || "");
           let output = markdown;
           if (output.length > maxOutputChars) {
@@ -403,7 +397,7 @@ export function registerCometAskTool(server: FastMCP) {
           const elapsed = Date.now() - startTime;
           if (elapsed > 10000 && responseLooksNew) {
             log('Task completed (quick response)');
-            const markdown = await cometAI.getResponseMarkdown({ stripCitations });
+            const markdown = await session.ai.getResponseMarkdown({ stripCitations });
             sessionManager.setSessionLastResponse(session.name, markdown || "");
             let output = markdown || 'Task completed (no response text extracted)';
             if (output.length > maxOutputChars) {

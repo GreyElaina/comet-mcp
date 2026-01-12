@@ -2,7 +2,6 @@ import { z } from "zod";
 import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
 import { sessionManager, SessionError } from "../session-manager.js";
-import { cometAI } from "../comet-ai.js";
 
 const schema = z.object({
   name: z.string().describe("Name of the session to focus"),
@@ -17,13 +16,8 @@ export function registerCometSessionFocusTool(server: FastMCP) {
     parameters: schema,
     execute: async (args) => {
       try {
-         await sessionManager.connectToSession(args.name);
-         sessionManager.focusSession(args.name);
-        
-        const model = sessionManager.getSessionDefaultModel(args.name);
-        if (model) {
-          cometAI.setDefaultModel(model);
-        }
+        await sessionManager.connectToSession(args.name);
+        sessionManager.focusSession(args.name);
         
         const session = sessionManager.getSession(args.name)!;
         return JSON.stringify({
@@ -31,7 +25,7 @@ export function registerCometSessionFocusTool(server: FastMCP) {
           session: {
             name: session.name,
             tabId: session.tabId,
-            defaultModel: session.defaultModel,
+            defaultModel: session.ai.getDefaultModel() ?? null,
             lastActivity: session.lastActivity,
           },
         }, null, 2);

@@ -159,6 +159,8 @@ export class CometAI {
   private cachedMode: { mode: CometMode; checkedAt: number } | null = null;
   private defaultModel: string | null = null;
 
+  constructor(private readonly targetId: string) {}
+
   setDefaultModel(model: string | null): void {
     this.defaultModel = model?.trim() || null;
   }
@@ -168,13 +170,12 @@ export class CometAI {
   }
 
   async detectMode(): Promise<{ mode: CometMode; hasAgentBrowsing: boolean }> {
-    const tabs = await cometClient.listTabsCategorized().catch(() => null);
-    const hasMain = !!tabs?.main;
-    const hasSidecar = !!tabs?.sidecar;
-    const hasAgentBrowsing = !!tabs?.agentBrowsing;
-    const mode: CometMode = (!hasMain && hasSidecar && hasAgentBrowsing) ? "agent" : "search";
+    const urlResult = await cometClient.safeEvaluate('window.location.href', this.targetId);
+    const currentUrl = (urlResult.result.value as string) || '';
+    const isSidecarUrl = currentUrl.includes('/sidecar');
+    const mode: CometMode = isSidecarUrl ? "agent" : "search";
     this.cachedMode = { mode, checkedAt: Date.now() };
-    return { mode, hasAgentBrowsing };
+    return { mode, hasAgentBrowsing: false };
   }
 
   async isAgentMode(): Promise<boolean> {
@@ -192,7 +193,7 @@ export class CometAI {
         const checked = document.querySelector('button[role="radio"][aria-checked="true"]');
         return checked ? checked.getAttribute('value') : null;
       })()
-    `);
+    `, this.targetId);
     const value = result.result.value as string | null;
     if (value === "search" || value === "research" || value === "studio") {
       return value;
@@ -225,7 +226,7 @@ export class CometAI {
           } catch {}
           return true;
         })()
-      `);
+      `, this.targetId);
       await new Promise((r) => setTimeout(r, 100));
     }
   }
@@ -253,7 +254,7 @@ export class CometAI {
         }
         return { ok: false, reason: 'Account menu trigger not found (no aria-haspopup="menu" in bottom-left)' };
       })()
-    `);
+    `, this.targetId);
 
     return (result.result.value as any) ?? { ok: false, reason: "evaluate failed" };
   }
@@ -313,7 +314,7 @@ export class CometAI {
 
         return { found: false, reason: 'No toggle found (menu may not be open)', menuItemCount: menuItems.length };
       })()
-    `);
+    `, this.targetId);
 
     if (result.exceptionDetails || result.result.value == null) {
       return { found: false, reason: "evaluate failed" };
@@ -329,7 +330,7 @@ export class CometAI {
     for (const selector of selectors) {
       const result = await cometClient.safeEvaluate(`
         document.querySelector(${JSON.stringify(selector)}) !== null
-      `);
+      `, this.targetId);
       if (result.result.value === true) {
         return selector;
       }
@@ -359,7 +360,7 @@ export class CometAI {
         contentEditables: document.querySelectorAll('[contenteditable="true"]').length,
         buttons: document.querySelectorAll('button').length,
       })
-    `);
+    `, this.targetId);
 
     return {
       inputSelector,
@@ -373,7 +374,7 @@ export class CometAI {
    * Send a prompt to Comet's AI (Perplexity)
    */
   async sendPrompt(prompt: string): Promise<string> {
-    await cometClient.ensureOnPerplexity();
+    await cometClient.ensureOnPerplexity(this.targetId);
 
     let focused: any = null;
     for (let i = 0; i < 30; i++) {
@@ -413,7 +414,7 @@ export class CometAI {
 
           return { ok: true, kind: target.kind };
         })()
-      `);
+      `, this.targetId);
 
       focused = probe?.result?.value;
       if (focused?.ok) break;
@@ -429,17 +430,17 @@ export class CometAI {
     // Clear existing content using real key events (prevents duplicate prompts).
     // On macOS, Cmd+A; also try Ctrl+A as a fallback.
     try {
-      await cometClient.pressKeyWithModifiers("a", 4, { code: "KeyA" });
-      await cometClient.pressKeyWithModifiers("a", 2, { code: "KeyA" });
-      await cometClient.pressKey("Backspace");
-      await cometClient.pressKey("Delete");
+      await cometClient.pressKeyWithModifiers("a", 4, { code: "KeyA", targetId: this.targetId });
+      await cometClient.pressKeyWithModifiers("a", 2, { code: "KeyA", targetId: this.targetId });
+      await cometClient.pressKey("Backspace", undefined, this.targetId);
+      await cometClient.pressKey("Delete", undefined, this.targetId);
     } catch {
       // Best-effort; continue.
     }
 
     // Use CDP Input.insertText to behave like real typing.
     try {
-      await cometClient.insertText(prompt);
+      await cometClient.insertText(prompt, this.targetId);
     } catch (e) {
       throw new Error(`Failed to insert text: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -505,7 +506,7 @@ export class CometAI {
           }
           return { ok: false, reason: 'no enabled submit button' };
         })()
-      `);
+      `, this.targetId);
       return (result?.result?.value as any)?.ok === true;
     };
 
@@ -517,7 +518,7 @@ export class CometAI {
 
     // Strategy: Use Enter key fallback
     try {
-      await cometClient.pressKey("Enter");
+      await cometClient.pressKey("Enter", undefined, this.targetId);
       await new Promise(resolve => setTimeout(resolve, 300));
       const submitted = await cometClient.safeEvaluate(`
         (() => {
@@ -525,7 +526,7 @@ export class CometAI {
             document.querySelector('[class*=\"animate-spin\"], [class*=\"animate-pulse\"], [class*=\"loading\"], [class*=\"thinking\"], .spinner') !== null;
           return hasLoading || window.location.href.includes('/search/');
         })()
-      `);
+      `, this.targetId);
       if (submitted.result.value) return;
     } catch {}
 
@@ -600,7 +601,7 @@ export class CometAI {
 
         return { clicked: false };
       })()
-    `);
+    `, this.targetId);
 
     const clicked = (clickResult.result.value as { clicked: boolean; method?: string })?.clicked;
 
@@ -703,7 +704,7 @@ export class CometAI {
         const end = Math.min(start + ${safeLimit}, total);
         return { total, slice: text.slice(start, end) };
       })()
-    `);
+    `, this.targetId);
 
     if (result.exceptionDetails || result.result.value == null) {
       return { total: 0, slice: "" };
@@ -762,7 +763,7 @@ export class CometAI {
         
         return { ok: true, markdown: captured || '' };
       })()
-    `);
+    `, this.targetId);
 
     const value = result.result?.value as { ok: boolean; markdown?: string; error?: string } | null;
     let markdown = value?.ok && value.markdown ? value.markdown : (await this.getLatestResponseSlice(0, 50000)).slice;
@@ -832,7 +833,7 @@ export class CometAI {
     mode: CometMode;
     debug?: unknown;
   }> {
-    await cometClient.ensureOnPerplexity();
+    await cometClient.ensureOnPerplexity(this.targetId);
 
     const inspectAllReasoning = options?.inspectAllReasoning === true;
     const openMenu = options?.openMenu === true || inspectAllReasoning;
@@ -899,7 +900,7 @@ export class CometAI {
           debug: ${includeRaw} ? debug : undefined,
         };
       })()
-    `);
+    `, this.targetId);
 
     if (base.exceptionDetails || base.result.value == null) {
       return {
@@ -972,7 +973,7 @@ export class CometAI {
           
           return { items, diagnostics };
         })()
-      `);
+      `, this.targetId);
       if (res.exceptionDetails || res.result.value == null) return { items: [], diagnostics: null };
       const result = res.result.value as { items: Array<{ name: string; selected: boolean }>; diagnostics: unknown };
       return result;
@@ -1112,7 +1113,7 @@ export class CometAI {
   `;
 
   private async getMenuState(): Promise<{ open: boolean; itemCount: number; hasToggle: boolean; toggleDisabled: boolean | null }> {
-    const result = await cometClient.safeEvaluate(`(() => { ${this.MENU_JS} return getModelMenuState(); })()`);
+    const result = await cometClient.safeEvaluate(`(() => { ${this.MENU_JS} return getModelMenuState(); })()`, this.targetId);
     return (result.result?.value as any) ?? { open: false, itemCount: 0, hasToggle: false, toggleDisabled: null };
   }
 
@@ -1153,7 +1154,7 @@ export class CometAI {
           document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
           document.querySelector('[role="menu"]')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         })()
-      `);
+      `, this.targetId);
       const { success } = await this.waitForMenu(s => !s.open, 400);
       if (success) return true;
     }
@@ -1177,7 +1178,7 @@ export class CometAI {
           if (btn) { btn.click(); return true; }
           return false;
         })()
-      `);
+      `, this.targetId);
       if (!clicked.result?.value) return false;
       const { success } = await this.waitForMenu(s => s.open && s.itemCount > 0, 800);
       if (success) return true;
@@ -1200,7 +1201,7 @@ export class CometAI {
         }
         return false;
       })()
-    `);
+    `, this.targetId);
     return result.result?.value === true;
   }
 
@@ -1250,7 +1251,7 @@ export class CometAI {
         
         return { detected: false, enabled: null, menuItemsTotal: menuItems.length, visibleMenuItems, togglesCount: toggles.length };
       })()
-    `);
+    `, this.targetId);
     const value = result.result.value as { detected: boolean; enabled: boolean | null; [k: string]: unknown } | null;
     if (result.exceptionDetails || value == null) {
       return { detected: false, enabled: null };
@@ -1286,7 +1287,7 @@ export class CometAI {
       earlyExit?: string;
     };
   }> {
-    await cometClient.ensureOnPerplexity();
+    await cometClient.ensureOnPerplexity(this.targetId);
 
     const opened = await this.openModelMenu();
     if (!opened) {
@@ -1356,7 +1357,7 @@ export class CometAI {
         
         return { clicked: false, menuitemCount: menuItems.length, toggleCount: toggles.length };
       })()
-    `);
+    `, this.targetId);
 
     await new Promise((r) => setTimeout(r, 400));
     const after = await this.detectReasoningToggle();
@@ -1418,7 +1419,7 @@ export class CometAI {
     mode: CometMode;
     debug?: unknown;
   }> {
-    await cometClient.ensureOnPerplexity();
+    await cometClient.ensureOnPerplexity(this.targetId);
 
     const target = (modelName || "").trim().toLowerCase();
     if (!target) {
@@ -1461,7 +1462,7 @@ export class CometAI {
         }
         return { clicked: false };
       })()
-    `);
+    `, this.targetId);
     
     if (!(openMenuResult.result.value as any)?.clicked) {
       return {
@@ -1517,7 +1518,7 @@ export class CometAI {
           
           return { clicked: false, matched: null, menuitemCount: visibleItems.length };
         })()
-      `);
+      `, this.targetId);
       
       clickInfo = result.result.value as typeof clickInfo;
       if (clickInfo?.clicked) break;
@@ -1525,7 +1526,7 @@ export class CometAI {
       await new Promise((r) => setTimeout(r, 100));
     }
 
-    await cometClient.safeEvaluate(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+    await cometClient.safeEvaluate(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`, this.targetId);
     await new Promise((r) => setTimeout(r, 200));
     
     const infoAfter = await this.getModelInfo({ openMenu: false, includeRaw: true });
@@ -1556,7 +1557,7 @@ export class CometAI {
     }>;
     debug?: unknown;
   }> {
-    await cometClient.ensureOnPerplexityMain();
+    await cometClient.ensureOnPerplexityMain(this.targetId);
 
     const includeRaw = options?.includeRaw === true;
 
@@ -1651,7 +1652,7 @@ export class CometAI {
     after: Awaited<ReturnType<CometAI["inspectTemporaryChat"]>>;
     debug?: unknown;
   }> {
-    await cometClient.ensureOnPerplexityMain();
+    await cometClient.ensureOnPerplexityMain(this.targetId);
 
     const includeRaw = options?.includeRaw === true;
     const before = await this.inspectTemporaryChat({ includeRaw: true });
@@ -1746,7 +1747,7 @@ export class CometAI {
 
         return { attempted: false, clicked: false, reason: 'no toggle found', menuItemCount: menuItems.length };
       })()
-    `);
+    `, this.targetId);
 
     await new Promise((r) => setTimeout(r, 200));
     await this.closeOverlays();
@@ -1771,7 +1772,7 @@ export class CometAI {
   //  * Clear the current conversation/input
   //  */
   // async clearConversation(): Promise<boolean> {
-  //   await cometClient.ensureOnPerplexity();
+  //   await cometClient.ensureOnPerplexity(this.targetId);
 
   //   const result = await cometClient.safeEvaluate(`
   //     (function() {
@@ -1795,7 +1796,7 @@ export class CometAI {
         
   //       return false;
   //     })()
-  //   `);
+  //   `, this.targetId);
   //   return result.result.value as boolean;
   // }
 
@@ -1818,20 +1819,8 @@ export class CometAI {
     agentBrowsingUrl: string;
     pageUrl: string;
   }> {
-    let agentBrowsingUrl = '';
-    let hasSidecar = false;
+    const agentBrowsingUrl = '';
     
-    try {
-      const tabs = await cometClient.listTabsCategorized();
-      if (tabs.agentBrowsing) {
-        agentBrowsingUrl = tabs.agentBrowsing.url;
-      }
-      hasSidecar = !!tabs.sidecar;
-      if (!tabs.main && hasSidecar && tabs.agentBrowsing) {
-        await cometClient.connectToSidecar();
-      }
-    } catch {}
-
     const result = await cometClient.safeEvaluate(`
       (() => {
         const body = document.body.innerText;
@@ -1936,12 +1925,9 @@ export class CometAI {
           latestResponseTail: latestResponse.slice(-${RESPONSE_TAIL_CHARS}),
         };
       })()
-    `);
+    `, this.targetId);
 
     if (result.exceptionDetails || result.result.value == null) {
-      if (hasSidecar) {
-        await cometClient.connectToMain().catch(() => {});
-      }
       return {
         status: "idle",
         steps: [],
@@ -1975,10 +1961,6 @@ export class CometAI {
       latestResponseTail: string;
     };
 
-    if (hasSidecar) {
-      await cometClient.connectToMain().catch(() => {});
-    }
-
     return {
       ...evalResult,
       agentBrowsingUrl,
@@ -2002,7 +1984,7 @@ export class CometAI {
         }
         return false;
       })()
-    `);
+    `, this.targetId);
 
     const clicked = result.result.value as boolean;
 
@@ -2014,25 +1996,15 @@ export class CometAI {
   }
 
   async exitAgentMode(): Promise<{ exited: boolean; reason?: string }> {
-    const tabs = await cometClient.listTabsCategorized();
-    if (!tabs.sidecar) {
+    const urlResult = await cometClient.safeEvaluate('window.location.href', this.targetId);
+    const currentUrl = (urlResult.result.value as string) || '';
+    
+    if (!currentUrl.includes('/sidecar')) {
       return { exited: false, reason: "not in agent mode" };
     }
 
-    const newTab = await cometClient.newTab(PERPLEXITY_URL);
-    await cometClient.connect(newTab.id);
-
+    await cometClient.navigate(PERPLEXITY_URL, true, this.targetId);
     await new Promise((r) => setTimeout(r, 1000));
-
-    try {
-      await cometClient.closeTab(tabs.sidecar.id);
-    } catch {}
-
-    if (tabs.agentBrowsing) {
-      try {
-        await cometClient.closeTab(tabs.agentBrowsing.id);
-      } catch {}
-    }
 
     return { exited: true };
   }
@@ -2077,7 +2049,7 @@ export class CometAI {
   }
 
   async uploadFiles(filePaths: string[]): Promise<FileUploadResult> {
-    await cometClient.ensureOnPerplexity();
+    await cometClient.ensureOnPerplexity(this.targetId);
 
     const errors: string[] = [];
     const validFiles: string[] = [];
@@ -2095,14 +2067,14 @@ export class CometAI {
       return { success: false, uploaded: 0, errors };
     }
 
-    const backendNodeId = await cometClient.getBackendNodeId('input[type="file"]');
+    const backendNodeId = await cometClient.getBackendNodeId('input[type="file"]', this.targetId);
     if (!backendNodeId) {
       errors.push("Could not find file input element in Perplexity UI");
       return { success: false, uploaded: 0, errors };
     }
 
     try {
-      await cometClient.setFileInputFiles(validFiles, { backendNodeId });
+      await cometClient.setFileInputFiles(validFiles, { backendNodeId, targetId: this.targetId });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       errors.push(`Failed to set files: ${message}`);
@@ -2118,7 +2090,7 @@ export class CometAI {
           const hasPreviewContainer = document.querySelector('.scroll-mx-md.px-sm.py-xs') !== null;
           return { hasRemoveButton, hasPreviewContainer };
         })()
-      `);
+      `, this.targetId);
       const val = status.result.value as { hasRemoveButton: boolean; hasPreviewContainer: boolean } | null;
       if (val?.hasRemoveButton || val?.hasPreviewContainer) {
         uploadConfirmed = true;
@@ -2139,4 +2111,3 @@ export class CometAI {
   }
 }
 
-export const cometAI = new CometAI();

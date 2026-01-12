@@ -1,7 +1,9 @@
 import { z } from "zod";
+import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
-import { cometAI } from "../comet-ai.js";
+import { sessionManager, SessionError } from "../session-manager.js";
+import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
 
 const schema = z.object({
   name: z
@@ -16,6 +18,9 @@ const schema = z.object({
     .describe(
       "Validate model exists in available models (requires Comet connection). Default: false"
     ),
+  session: z.string().optional().describe(
+    "Named session to set model for. Default: use focused session or auto-create 'default'."
+  ),
 });
 
 const description = `Set default Perplexity model for subsequent comet_ask calls. Model will be switched automatically when needed. Use comet_list_models to see available options. Call with empty name to clear default.`;
@@ -26,9 +31,34 @@ export function registerCometSetModelTool(server: FastMCP) {
     description,
     parameters: schema,
     execute: async (args) => {
+      let session: SessionState;
+      if (args.session) {
+        if (!sessionManager.validateSessionName(args.session)) {
+          throw new UserError(INVALID_SESSION_NAME_ERROR + args.session);
+        }
+        const existingSession = sessionManager.getSession(args.session);
+        if (!existingSession) {
+          throw new UserError(
+            `Session '${args.session}' not found.\n\nUse comet_ask({ session: "${args.session}" }) to create it first, or comet_session_list to see active sessions.`
+          );
+        }
+        session = existingSession;
+      } else {
+        session = await sessionManager.resolveFocusedOrDefault();
+      }
+      try {
+        await sessionManager.connectToSession(session.name);
+      } catch (e) {
+        if (e instanceof SessionError) {
+          throw new UserError(e.message);
+        }
+        throw e;
+      }
+      sessionManager.updateSessionActivity(session.name);
+
       const name = String(args.name ?? "").trim();
       const validate = !!args.validate;
-      const previous = cometAI.getDefaultModel();
+      const previous = session.ai.getDefaultModel();
 
       const result: Record<string, unknown> = {
         action: name ? "set" : "cleared",
@@ -39,7 +69,7 @@ export function registerCometSetModelTool(server: FastMCP) {
       if (validate && name) {
         if (cometClient.isConnected) {
           try {
-            const info = await cometAI.getModelInfo({ openMenu: true });
+            const info = await session.ai.getModelInfo({ openMenu: true });
             const available = info.availableModels;
             const nameLower = name.toLowerCase();
             const match = available.find((m) =>
@@ -71,8 +101,8 @@ export function registerCometSetModelTool(server: FastMCP) {
         }
       }
 
-      cometAI.setDefaultModel(name || null);
-      result.current = cometAI.getDefaultModel() ?? null;
+      session.ai.setDefaultModel(name || null);
+      result.current = session.ai.getDefaultModel() ?? null;
 
       return JSON.stringify(result, null, 2);
     },

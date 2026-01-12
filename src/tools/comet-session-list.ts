@@ -21,7 +21,7 @@ export function registerCometSessionListTool(server: FastMCP) {
         createdAt: s.createdAt,
         lastActivity: s.lastActivity,
         isFocused: s.name === focusedName,
-        defaultModel: s.defaultModel,
+        defaultModel: s.ai.getDefaultModel() ?? null,
       }));
       
       return JSON.stringify(result, null, 2);

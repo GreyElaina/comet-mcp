@@ -1,5 +1,7 @@
 // Type definitions for CDP client and Comet MCP Server
 
+import type { CometAI } from "./comet-ai.js";
+
 export interface CDPTarget {
   id: string;
   type: string;
@@ -65,6 +67,6 @@ export interface SessionState {
   tabId: string;
   createdAt: number;
   lastActivity: number;
-  defaultModel: string | null;
   lastResponseText: string;
+  ai: CometAI;
 }

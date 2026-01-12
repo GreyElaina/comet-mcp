@@ -26,10 +26,11 @@ export const parsePositiveInt = (value: unknown): number | null => {
   return Math.trunc(n);
 };
 
-export const isUsableViewport = async (): Promise<boolean> => {
+export const isUsableViewport = async (targetId: string): Promise<boolean> => {
   try {
     const metrics = await cometClient.safeEvaluate(
-      `(() => ({ w: window.innerWidth, h: window.innerHeight }))()`
+      `(() => ({ w: window.innerWidth, h: window.innerHeight }))()`,
+      targetId
     );
     const v = metrics?.result?.value as any;
     const w = Number(v?.w ?? 0);
@@ -45,8 +46,9 @@ export const ensureConnectedToComet = async (session?: SessionState): Promise<st
     return null;
   }
 
-  if (cometClient.isConnected) {
-    if (await isUsableViewport()) return null;
+  const currentState = cometClient.currentState;
+  if (cometClient.isConnected && currentState.activeTabId) {
+    if (await isUsableViewport(currentState.activeTabId)) return null;
     try {
       await cometClient.disconnect();
     } catch {}
@@ -74,7 +76,7 @@ export const ensureConnectedToComet = async (session?: SessionState): Promise<st
     try {
       await cometClient.connect(tab.id);
       await new Promise((r) => setTimeout(r, 150));
-      if (await isUsableViewport()) return startResult;
+      if (await isUsableViewport(tab.id)) return startResult;
     } catch {}
   }
 

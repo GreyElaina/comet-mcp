@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
-import { cometAI } from "../comet-ai.js";
+import { CometAI } from "../comet-ai.js";
 import { sessionManager, PERPLEXITY_URL } from "../session-manager.js";
 
 const schema = z.object({
@@ -46,19 +46,24 @@ export function registerCometResetTool(server: FastMCP) {
        const freshTargets = await cometClient.listTargets();
       const anyPage = freshTargets.find((t) => t.type === "page");
 
+      let activeTabId: string;
       if (anyPage) {
         await cometClient.connect(anyPage.id);
-        await cometClient.navigate(PERPLEXITY_URL, true);
+        await cometClient.navigate(PERPLEXITY_URL, true, anyPage.id);
         await new Promise((resolve) => setTimeout(resolve, 1500));
+        activeTabId = anyPage.id;
       } else {
         const newTab = await cometClient.newTab(PERPLEXITY_URL);
         await new Promise((resolve) => setTimeout(resolve, 2000));
         await cometClient.connect(newTab.id);
+        activeTabId = newTab.id;
       }
 
+      // Create a temporary CometAI instance for the remaining tab to get state info
+      const tempAI = new CometAI(activeTabId);
       const [uiMode, modelInfo] = await Promise.all([
-        cometAI.getPerplexityUIMode().catch(() => null),
-        cometAI.getModelInfo({ openMenu: false }).catch(() => null),
+        tempAI.getPerplexityUIMode().catch(() => null),
+        tempAI.getModelInfo({ openMenu: false }).catch(() => null),
       ]);
 
       const sessionsAfter = sessionManager.getSessionCount();
@@ -67,7 +72,6 @@ export function registerCometResetTool(server: FastMCP) {
         status: "connected",
         mode: uiMode || "unknown",
         model: modelInfo?.currentModel || "unknown",
-        defaultModel: cometAI.getDefaultModel(),
         tabsCleaned: pageTabs.length > 1 ? pageTabs.length - 1 : 0,
         sessionsBefore,
         sessionsAfter,

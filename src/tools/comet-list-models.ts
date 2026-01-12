@@ -1,6 +1,8 @@
 import { z } from "zod";
+import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
-import { cometAI } from "../comet-ai.js";
+import { sessionManager, SessionError } from "../session-manager.js";
+import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
 
 const schema = z.object({
   openMenu: z
@@ -15,6 +17,9 @@ const schema = z.object({
     .boolean()
     .optional()
     .describe("Include debug details (default: false)"),
+  session: z.string().optional().describe(
+    "Named session to use. Default: use focused session or auto-create 'default'."
+  ),
 });
 
 const description = `List available Perplexity models (best-effort; depends on account/UI). Use openMenu=true to actively open the model selector and scrape options.`;
@@ -25,11 +30,36 @@ export function registerCometListModelsTool(server: FastMCP) {
     description,
     parameters: schema,
     execute: async (args) => {
+      let session: SessionState;
+      if (args.session) {
+        if (!sessionManager.validateSessionName(args.session)) {
+          throw new UserError(INVALID_SESSION_NAME_ERROR + args.session);
+        }
+        const existingSession = sessionManager.getSession(args.session);
+        if (!existingSession) {
+          throw new UserError(
+            `Session '${args.session}' not found.\n\nUse comet_ask({ session: "${args.session}" }) to create it first, or comet_session_list to see active sessions.`
+          );
+        }
+        session = existingSession;
+      } else {
+        session = await sessionManager.resolveFocusedOrDefault();
+      }
+      try {
+        await sessionManager.connectToSession(session.name);
+      } catch (e) {
+        if (e instanceof SessionError) {
+          throw new UserError(e.message);
+        }
+        throw e;
+      }
+      sessionManager.updateSessionActivity(session.name);
+
       const openMenu = !!args.openMenu;
       const inspectAllReasoning = !!args.inspectAllReasoning;
       const includeRaw = !!args.includeRaw;
 
-      const info = await cometAI.getModelInfo({
+      const info = await session.ai.getModelInfo({
         openMenu,
         inspectAllReasoning,
         includeRaw,

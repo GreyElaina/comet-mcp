@@ -2,7 +2,6 @@ import { z } from "zod";
 import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
-import { cometAI } from "../comet-ai.js";
 import { parsePositiveInt } from "./shared.js";
 import { sessionManager, SessionError } from "../session-manager.js";
 import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
@@ -66,7 +65,7 @@ export function registerCometPollTool(server: FastMCP) {
       const limit = parsePositiveInt(args.limit) ?? 24000;
       const includeSettings = !!args.includeSettings;
 
-      const status = await cometAI.getAgentStatus();
+      const status = await session.ai.getAgentStatus();
 
       const result: Record<string, unknown> = {
         status: status.status,
@@ -79,11 +78,11 @@ export function registerCometPollTool(server: FastMCP) {
             if (checked) return checked.getAttribute('value') || 'search';
             return 'search';
           })()
-        `);
+        `, session.tabId);
         const currentMode = modeResult.result.value as string;
-        const tempChatInfo = await cometAI.inspectTemporaryChat();
-        const modelInfo = await cometAI.getModelInfo({ openMenu: false });
-        const reasoningInfo = await cometAI.inspectReasoning();
+        const tempChatInfo = await session.ai.inspectTemporaryChat();
+        const modelInfo = await session.ai.getModelInfo({ openMenu: false });
+        const reasoningInfo = await session.ai.inspectReasoning();
 
         result.settings = {
           mode: currentMode,
@@ -110,7 +109,7 @@ export function registerCometPollTool(server: FastMCP) {
       }
 
       if (status.status === "completed") {
-        const { total, slice } = await cometAI.getLatestResponseSlice(offset, limit);
+        const { total, slice } = await session.ai.getLatestResponseSlice(offset, limit);
         if (slice) {
           const start = Math.min(offset, total);
           const end = Math.min(start + slice.length, total);

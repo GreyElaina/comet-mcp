@@ -1,4 +1,5 @@
 import { cometClient } from "./cdp-client.js";
+import { CometAI } from "./comet-ai.js";
 import {
   SessionState,
   SESSION_NAME_REGEX,
@@ -66,8 +67,8 @@ class SessionManager {
           tabId: tab.id,
           createdAt: now,
           lastActivity: now,
-          defaultModel: null,
           lastResponseText: "",
+          ai: new CometAI(tab.id),
         };
 
         this.sessions.set(name, newSession);
@@ -205,18 +206,6 @@ class SessionManager {
     const session = this.sessions.get(name);
     if (session) {
       session.lastActivity = Date.now();
-    }
-  }
-
-  getSessionDefaultModel(name: string): string | null {
-    const session = this.sessions.get(name);
-    return session?.defaultModel ?? null;
-  }
-
-  setSessionDefaultModel(name: string, model: string | null): void {
-    const session = this.sessions.get(name);
-    if (session) {
-      session.defaultModel = model;
     }
   }
 

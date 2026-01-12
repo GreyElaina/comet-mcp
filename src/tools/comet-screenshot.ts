@@ -51,7 +51,7 @@ export function registerCometScreenshotTool(server: FastMCP) {
 
       await pruneScreenshotResources();
 
-      const result = await cometClient.screenshot("png");
+      const result = await cometClient.screenshot("png", undefined, session.tabId);
       const entry = await saveScreenshotResource(result.data, "image/png");
 
       const metadata = {

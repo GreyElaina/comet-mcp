@@ -41,7 +41,7 @@ function isRecoverableError(error: unknown): boolean {
 export class CometCDPClient {
   private browser: Browser | null = null;
   private browserSession: CDPSession | null = null;
-  private session: CDPSession | null = null;
+  private sessions: Map<string, CDPSession> = new Map();
   private cometProcess: ChildProcess | null = null;
   private state: CometState = {
     connected: false,
@@ -51,14 +51,22 @@ export class CometCDPClient {
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number = 5;
   private reconnectPromise: Promise<string> | null = null;
-  private connectPromise: Promise<string> | null = null;
+  private connectPromises: Map<string, Promise<string>> = new Map();
 
   get isConnected(): boolean {
-    return this.state.connected && this.session !== null;
+    return this.state.connected && this.sessions.size > 0;
   }
 
   get currentState(): CometState {
     return { ...this.state };
+  }
+
+  getSession(targetId: string): CDPSession | null {
+    return this.sessions.get(targetId) || null;
+  }
+
+  hasSession(targetId: string): boolean {
+    return this.sessions.has(targetId);
   }
 
   // ============================================================
@@ -95,11 +103,21 @@ export class CometCDPClient {
     });
   }
 
-  private resetConnectionState(): void {
-    this.state.connected = false;
-    this.state.activeTabId = undefined;
-    this.state.currentUrl = undefined;
-    this.session = null;
+  private resetConnectionState(targetId?: string): void {
+    if (targetId) {
+      this.sessions.delete(targetId);
+      this.connectPromises.delete(targetId);
+      if (this.state.activeTabId === targetId) {
+        this.state.activeTabId = undefined;
+        this.state.currentUrl = undefined;
+      }
+    } else {
+      this.sessions.clear();
+      this.connectPromises.clear();
+      this.state.activeTabId = undefined;
+      this.state.currentUrl = undefined;
+    }
+    this.state.connected = this.sessions.size > 0;
   }
 
   private handleBrowserDisconnect(): void {
@@ -171,7 +189,7 @@ export class CometCDPClient {
     const targets = await this.listTargets();
 
     const lastTarget = this.lastTargetId ? targets.find((t) => t.id === this.lastTargetId) : null;
-    if (lastTarget) {
+    if (lastTarget && this.lastTargetId) {
       return await this.connect(this.lastTargetId);
     }
 
@@ -189,18 +207,24 @@ export class CometCDPClient {
     throw new Error("No suitable tab found for reconnection");
   }
 
-  /**
-   * Cleanup current connection
-   */
-  private async cleanupConnection(): Promise<void> {
-    if (this.session) {
-      try {
-        await this.session.detach();
-      } catch {
-        // Ignore detach errors
+  private async cleanupConnection(targetId?: string): Promise<void> {
+    if (targetId) {
+      const session = this.sessions.get(targetId);
+      if (session) {
+        try {
+          await session.detach();
+        } catch {
+          // Ignore detach errors
+        }
       }
+      this.resetConnectionState(targetId);
+    } else {
+      const detachPromises = Array.from(this.sessions.values()).map((session) =>
+        session.detach().catch(() => {})
+      );
+      await Promise.all(detachPromises);
+      this.resetConnectionState();
     }
-    this.resetConnectionState();
   }
 
   // ============================================================
@@ -245,43 +269,36 @@ export class CometCDPClient {
     });
   }
 
-  async connect(targetId?: string): Promise<string> {
-    if (this.connectPromise) {
-      return this.connectPromise;
+  async connect(targetId: string): Promise<string> {
+    const existingPromise = this.connectPromises.get(targetId);
+    if (existingPromise) {
+      return existingPromise;
     }
 
-    this.connectPromise = this.doConnect(targetId).finally(() => {
-      this.connectPromise = null;
+    const connectPromise = this.doConnect(targetId).finally(() => {
+      this.connectPromises.delete(targetId);
     });
+    this.connectPromises.set(targetId, connectPromise);
 
-    return this.connectPromise;
+    return connectPromise;
   }
 
-  private async doConnect(targetId?: string): Promise<string> {
+  private async doConnect(targetId: string): Promise<string> {
     await this.connectBrowser();
-    await this.cleanupConnection();
+    await this.cleanupConnection(targetId);
 
-    let resolvedTargetId = targetId;
-    if (!resolvedTargetId) {
-      const targets = await this.listTargets();
-      const page = targets.find((t) => t.type === "page" && t.url !== "about:blank");
-      if (!page) {
-        throw new Error("No suitable page target found to connect to");
-      }
-      resolvedTargetId = page.id;
-    }
+    const session = await this.createSessionForTarget(targetId);
+    this.sessions.set(targetId, session);
 
-    this.session = await this.createSessionForTarget(resolvedTargetId);
-
-    this.session.once("sessiondetached", () => {
-      this.resetConnectionState();
+    session.once("sessiondetached", () => {
+      this.resetConnectionState(targetId);
     });
 
     await Promise.all([
-      this.session.send("Page.enable"),
-      this.session.send("Runtime.enable"),
-      this.session.send("DOM.enable"),
-      this.session.send("Network.enable"),
+      session.send("Page.enable"),
+      session.send("Runtime.enable"),
+      session.send("DOM.enable"),
+      session.send("Network.enable"),
     ]);
 
     const shouldForeground =
@@ -289,22 +306,22 @@ export class CometCDPClient {
 
     if (shouldForeground) {
       try {
-        await this.session.send("Page.bringToFront");
+        await session.send("Page.bringToFront");
       } catch {
         // Not fatal
       }
 
       try {
-        const { windowId } = await this.session.send("Browser.getWindowForTarget", {
-          targetId: resolvedTargetId,
+        const { windowId } = await session.send("Browser.getWindowForTarget", {
+          targetId,
         });
-        await this.session.send("Browser.setWindowBounds", {
+        await session.send("Browser.setWindowBounds", {
           windowId,
           bounds: { width: 1440, height: 900, windowState: "normal" },
         });
       } catch {
         try {
-          await this.session.send("Emulation.setDeviceMetricsOverride", {
+          await session.send("Emulation.setDeviceMetricsOverride", {
             width: 1440,
             height: 900,
             deviceScaleFactor: 1,
@@ -317,11 +334,11 @@ export class CometCDPClient {
     }
 
     this.state.connected = true;
-    this.state.activeTabId = resolvedTargetId;
-    this.lastTargetId = resolvedTargetId;
+    this.state.activeTabId = targetId;
+    this.lastTargetId = targetId;
     this.reconnectAttempts = 0;
 
-    const { result } = (await this.session.send("Runtime.evaluate", {
+    const { result } = (await session.send("Runtime.evaluate", {
       expression: "window.location.href",
     })) as EvaluateResult;
     this.state.currentUrl = result.value as string;
@@ -434,13 +451,10 @@ export class CometCDPClient {
     };
   }
 
-  /**
-   * Get the current page URL of the connected tab
-   */
-  async getCurrentUrl(): Promise<string | null> {
-    if (!this.session) return null;
+  async getCurrentUrl(targetId: string): Promise<string | null> {
     try {
-      const { result } = (await this.session.send("Runtime.evaluate", {
+      const session = this.getSessionOrThrow(targetId);
+      const { result } = (await session.send("Runtime.evaluate", {
         expression: "location.href",
       })) as EvaluateResult;
       return (result.value as string) || null;
@@ -452,8 +466,8 @@ export class CometCDPClient {
   /**
    * Ensure we're connected to a Perplexity page (main or sidecar).
    */
-  async ensureOnPerplexity(): Promise<void> {
-    const url = await this.getCurrentUrl();
+  async ensureOnPerplexity(targetId: string): Promise<void> {
+    const url = await this.getCurrentUrl(targetId);
     if (url?.includes("perplexity.ai")) return;
 
     try {
@@ -479,8 +493,8 @@ export class CometCDPClient {
   /**
    * Ensure we're connected to the main Perplexity page (not sidecar).
    */
-  async ensureOnPerplexityMain(): Promise<void> {
-    const url = await this.getCurrentUrl();
+  async ensureOnPerplexityMain(targetId: string): Promise<void> {
+    const url = await this.getCurrentUrl(targetId);
     if (url?.includes("perplexity.ai") && !url.includes("sidecar")) return;
 
     try {
@@ -622,16 +636,15 @@ export class CometCDPClient {
   /**
    * Navigate to a URL
    */
-  async navigate(url: string, waitForLoad: boolean = true): Promise<NavigateResult> {
-    this.ensureConnected();
-
-    const result = (await this.session!.send("Page.navigate", { url })) as NavigateResult;
+  async navigate(url: string, waitForLoad: boolean, targetId: string): Promise<NavigateResult> {
+    const session = this.getSessionOrThrow(targetId);
+    const result = (await session.send("Page.navigate", { url })) as NavigateResult;
 
     if (waitForLoad) {
       const start = Date.now();
       while (Date.now() - start < 15000) {
         try {
-          const ready = (await this.session!.send("Runtime.evaluate", {
+          const ready = (await session.send("Runtime.evaluate", {
             expression: "document.readyState",
             returnByValue: true,
           })) as EvaluateResult;
@@ -651,24 +664,24 @@ export class CometCDPClient {
   /**
    * Capture screenshot
    */
-  async screenshot(format: "png" | "jpeg" = "png", quality?: number): Promise<ScreenshotResult> {
-    this.ensureConnected();
+  async screenshot(format: "png" | "jpeg", quality: number | undefined, targetId: string): Promise<ScreenshotResult> {
+    const session = this.getSessionOrThrow(targetId);
 
     const options: { format: "png" | "jpeg" | "webp"; quality?: number } = { format };
     if (quality !== undefined && format !== "png") {
       options.quality = quality;
     }
 
-    return this.session!.send("Page.captureScreenshot", options) as Promise<ScreenshotResult>;
+    return session.send("Page.captureScreenshot", options) as Promise<ScreenshotResult>;
   }
 
   /**
    * Execute JavaScript in the page context
    */
-  async evaluate(expression: string): Promise<EvaluateResult> {
-    this.ensureConnected();
+  async evaluate(expression: string, targetId: string): Promise<EvaluateResult> {
+    const session = this.getSessionOrThrow(targetId);
 
-    return this.session!.send("Runtime.evaluate", {
+    return session.send("Runtime.evaluate", {
       expression,
       awaitPromise: true,
       returnByValue: true,
@@ -678,10 +691,10 @@ export class CometCDPClient {
   /**
    * Execute JavaScript with auto-reconnect on connection loss
    */
-  async safeEvaluate(expression: string): Promise<EvaluateResult> {
+  async safeEvaluate(expression: string, targetId: string): Promise<EvaluateResult> {
     return this.withAutoReconnect(async () => {
-      this.ensureConnected();
-      return this.session!.send("Runtime.evaluate", {
+      const session = this.getSessionOrThrow(targetId);
+      return session.send("Runtime.evaluate", {
         expression,
         awaitPromise: true,
         returnByValue: true,
@@ -692,8 +705,8 @@ export class CometCDPClient {
   /**
    * Get page HTML content
    */
-  async getPageContent(): Promise<string> {
-    const result = await this.evaluate("document.documentElement.outerHTML");
+  async getPageContent(targetId: string): Promise<string> {
+    const result = await this.evaluate("document.documentElement.outerHTML", targetId);
     if (result.exceptionDetails) {
       throw new Error(result.exceptionDetails.text);
     }
@@ -703,8 +716,8 @@ export class CometCDPClient {
   /**
    * Get page text content
    */
-  async getPageText(): Promise<string> {
-    const result = await this.evaluate("document.body.innerText");
+  async getPageText(targetId: string): Promise<string> {
+    const result = await this.evaluate("document.body.innerText", targetId);
     if (result.exceptionDetails) {
       throw new Error(result.exceptionDetails.text);
     }
@@ -718,7 +731,7 @@ export class CometCDPClient {
   /**
    * Click on an element
    */
-  async click(selector: string): Promise<boolean> {
+  async click(selector: string, targetId: string): Promise<boolean> {
     const result = await this.evaluate(`
       (function() {
         const el = document.querySelector(${JSON.stringify(selector)});
@@ -728,14 +741,14 @@ export class CometCDPClient {
         }
         return false;
       })()
-    `);
+    `, targetId);
     return result.result.value as boolean;
   }
 
   /**
    * Type text into an element
    */
-  async type(selector: string, text: string): Promise<boolean> {
+  async type(selector: string, text: string, targetId: string): Promise<boolean> {
     const result = await this.evaluate(`
       (function() {
         const el = document.querySelector(${JSON.stringify(selector)});
@@ -748,53 +761,50 @@ export class CometCDPClient {
         }
         return false;
       })()
-    `);
+    `, targetId);
     return result.result.value as boolean;
   }
 
   /**
    * Press a key
    */
-  async pressKey(key: string, selector?: string): Promise<void> {
-    this.ensureConnected();
+  async pressKey(key: string, selector: string | undefined, targetId: string): Promise<void> {
+    const session = this.getSessionOrThrow(targetId);
 
     if (selector) {
-      await this.evaluate(`document.querySelector(${JSON.stringify(selector)})?.focus()`);
+      await this.evaluate(`document.querySelector(${JSON.stringify(selector)})?.focus()`, targetId);
     }
 
-    await this.session!.send("Input.dispatchKeyEvent", {
+    await session.send("Input.dispatchKeyEvent", {
       type: "keyDown",
       key,
     });
-    await this.session!.send("Input.dispatchKeyEvent", {
+    await session.send("Input.dispatchKeyEvent", {
       type: "keyUp",
       key,
     });
   }
 
-  /**
-   * Press a key with modifiers (CDP modifiers bitmask: alt=1, ctrl=2, meta=4, shift=8)
-   */
   async pressKeyWithModifiers(
     key: string,
     modifiers: number,
-    options?: { code?: string; selector?: string }
+    options: { code?: string; selector?: string; targetId: string }
   ): Promise<void> {
-    this.ensureConnected();
+    const session = this.getSessionOrThrow(options.targetId);
 
-    if (options?.selector) {
-      await this.evaluate(`document.querySelector(${JSON.stringify(options.selector)})?.focus()`);
+    if (options.selector) {
+      await this.evaluate(`document.querySelector(${JSON.stringify(options.selector)})?.focus()`, options.targetId);
     }
 
-    const code = options?.code;
+    const code = options.code;
 
-    await this.session!.send("Input.dispatchKeyEvent", {
+    await session.send("Input.dispatchKeyEvent", {
       type: "keyDown",
       key,
       code,
       modifiers,
     });
-    await this.session!.send("Input.dispatchKeyEvent", {
+    await session.send("Input.dispatchKeyEvent", {
       type: "keyUp",
       key,
       code,
@@ -802,24 +812,21 @@ export class CometCDPClient {
     });
   }
 
-  /**
-   * Insert text into the currently focused element
-   */
-  async insertText(text: string): Promise<void> {
-    this.ensureConnected();
-    await this.session!.send("Input.insertText", { text });
+  async insertText(text: string, targetId: string): Promise<void> {
+    const session = this.getSessionOrThrow(targetId);
+    await session.send("Input.insertText", { text });
   }
 
   /**
    * Wait for an element to appear
    */
-  async waitForSelector(selector: string, timeout: number = 10000): Promise<boolean> {
+  async waitForSelector(selector: string, timeout: number, targetId: string): Promise<boolean> {
     const startTime = Date.now();
 
     while (Date.now() - startTime < timeout) {
       const result = await this.evaluate(`
         document.querySelector(${JSON.stringify(selector)}) !== null
-      `);
+      `, targetId);
 
       if (result.result.value === true) {
         return true;
@@ -834,16 +841,15 @@ export class CometCDPClient {
   /**
    * Wait for page to be idle (no pending network requests)
    */
-  async waitForNetworkIdle(timeout: number = 5000): Promise<void> {
-    this.ensureConnected();
-    const session = this.session!;
+  async waitForNetworkIdle(timeout: number, targetId: string): Promise<void> {
+    const session = this.getSessionOrThrow(targetId);
 
     return new Promise((resolve) => {
       let pendingRequests = 0;
       let idleTimer: NodeJS.Timeout;
       let resolved = false;
 
-      const isStale = () => session !== this.session;
+      const isStale = () => this.sessions.get(targetId) !== session;
 
       const cleanup = () => {
         session.off("Network.requestWillBeSent", onRequest);
@@ -949,10 +955,10 @@ export class CometCDPClient {
    */
   async setFileInputFiles(
     files: string[],
-    options: { nodeId?: number; backendNodeId?: number; objectId?: string }
+    options: { nodeId?: number; backendNodeId?: number; objectId?: string; targetId: string }
   ): Promise<void> {
-    this.ensureConnected();
-    await this.session!.send("DOM.setFileInputFiles", {
+    const session = this.getSessionOrThrow(options.targetId);
+    await session.send("DOM.setFileInputFiles", {
       files,
       nodeId: options.nodeId,
       backendNodeId: options.backendNodeId,
@@ -960,40 +966,34 @@ export class CometCDPClient {
     });
   }
 
-  /**
-   * Get the nodeId of an element by selector
-   */
-  async getNodeId(selector: string): Promise<number | null> {
-    this.ensureConnected();
-    const doc = await this.session!.send("DOM.getDocument");
-    const result = await this.session!.send("DOM.querySelector", {
+  async getNodeId(selector: string, targetId: string): Promise<number | null> {
+    const session = this.getSessionOrThrow(targetId);
+    const doc = await session.send("DOM.getDocument");
+    const result = await session.send("DOM.querySelector", {
       nodeId: doc.root.nodeId,
       selector,
     });
     return result.nodeId || null;
   }
 
-  /**
-   * Get the backendNodeId of an element by selector
-   */
-  async getBackendNodeId(selector: string): Promise<number | null> {
-    this.ensureConnected();
+  async getBackendNodeId(selector: string, targetId: string): Promise<number | null> {
+    const session = this.getSessionOrThrow(targetId);
     const result = await this.evaluate(`
       (() => {
         const el = document.querySelector(${JSON.stringify(selector)});
         return el ? true : false;
       })()
-    `);
+    `, targetId);
     if (!result.result.value) return null;
 
-    const doc = await this.session!.send("DOM.getDocument");
-    const queryResult = await this.session!.send("DOM.querySelector", {
+    const doc = await session.send("DOM.getDocument");
+    const queryResult = await session.send("DOM.querySelector", {
       nodeId: doc.root.nodeId,
       selector,
     });
     if (!queryResult.nodeId) return null;
 
-    const nodeDesc = await this.session!.send("DOM.describeNode", {
+    const nodeDesc = await session.send("DOM.describeNode", {
       nodeId: queryResult.nodeId,
     });
     return nodeDesc.node.backendNodeId || null;
@@ -1003,10 +1003,12 @@ export class CometCDPClient {
   // Utility
   // ============================================================
 
-  private ensureConnected(): void {
-    if (!this.session) {
-      throw new Error("Not connected to Comet. Call connect() first.");
+  private getSessionOrThrow(targetId: string): CDPSession {
+    const session = this.sessions.get(targetId);
+    if (!session) {
+      throw new Error(`No CDP session for targetId: ${targetId}. Call connect(targetId) first.`);
     }
+    return session;
   }
 }
 

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
-import { cometAI } from "../comet-ai.js";
+
 import { sessionManager, SessionError } from "../session-manager.js";
 import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
 
@@ -44,7 +44,7 @@ export function registerCometStopTool(server: FastMCP) {
       }
       sessionManager.updateSessionActivity(session.name);
 
-      const stopped = await cometAI.stopAgent();
+      const stopped = await session.ai.stopAgent();
       return JSON.stringify({ stopped }, null, 2);
     },
   });
