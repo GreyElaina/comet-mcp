@@ -55,3 +55,16 @@ export interface CometAIResponse {
   complete: boolean;
   timestamp: number;
 }
+
+// Session management types
+export const SESSION_NAME_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
+export const INVALID_SESSION_NAME_ERROR = "Session name must contain only letters, numbers, underscores, and hyphens (1-64 chars). Got: ";
+
+export interface SessionState {
+  name: string;
+  tabId: string;
+  createdAt: number;
+  lastActivity: number;
+  defaultModel: string | null;
+  lastResponseText: string;
+}
