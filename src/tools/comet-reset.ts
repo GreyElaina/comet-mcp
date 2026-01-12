@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
 import { cometAI } from "../comet-ai.js";
-import { sessionManager } from "../session-manager.js";
+import { sessionManager, PERPLEXITY_URL } from "../session-manager.js";
 
 const schema = z.object({
   hard: z.boolean().optional().describe(
@@ -48,10 +48,10 @@ export function registerCometResetTool(server: FastMCP) {
 
       if (anyPage) {
         await cometClient.connect(anyPage.id);
-        await cometClient.navigate("https://www.perplexity.ai/", true);
+        await cometClient.navigate(PERPLEXITY_URL, true);
         await new Promise((resolve) => setTimeout(resolve, 1500));
       } else {
-        const newTab = await cometClient.newTab("https://www.perplexity.ai/");
+        const newTab = await cometClient.newTab(PERPLEXITY_URL);
         await new Promise((resolve) => setTimeout(resolve, 2000));
         await cometClient.connect(newTab.id);
       }

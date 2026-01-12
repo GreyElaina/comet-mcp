@@ -1,5 +1,6 @@
 import { cometClient } from "../cdp-client.js";
 import { SessionState } from "../types.js";
+import { PERPLEXITY_URL } from "../session-manager.js";
 
 export const chunkText = (text: string, chunkSize = 8000): string[] => {
   if (text.length <= chunkSize) return [text];
@@ -77,7 +78,7 @@ export const ensureConnectedToComet = async (session?: SessionState): Promise<st
     } catch {}
   }
 
-  const newTab = await cometClient.newTab("https://www.perplexity.ai/");
+  const newTab = await cometClient.newTab(PERPLEXITY_URL);
   await new Promise((resolve) => setTimeout(resolve, 2000));
   await cometClient.connect(newTab.id);
   return startResult;

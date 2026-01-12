@@ -11,6 +11,7 @@ import type {
   EvaluateResult,
   CometState,
 } from "./types.js";
+import { PERPLEXITY_URL } from "./session-manager.js";
 
 const COMET_PATH = "/Applications/Comet.app/Contents/MacOS/Comet";
 const DEFAULT_PORT = parseInt(process.env.COMET_PORT || "9222", 10);
@@ -471,7 +472,7 @@ export class CometCDPClient {
 
     throw new Error(
       `Not on Perplexity page (current: ${url || "unknown"}). ` +
-        `No Perplexity tab found. Please navigate to https://www.perplexity.ai/`
+        `No Perplexity tab found. Please navigate to ${PERPLEXITY_URL}`
     );
   }
 

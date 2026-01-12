@@ -6,7 +6,7 @@ import {
   CDPTarget,
 } from "./types.js";
 
-const PERPLEXITY_URL = "https://www.perplexity.ai/";
+export const PERPLEXITY_URL = "https://www.perplexity.ai/";
 const MAX_RESPONSE_TEXT_SIZE = 50 * 1024; // 50KB
 
 export class SessionError extends Error {

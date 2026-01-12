@@ -7,6 +7,7 @@ import mime from "mime-types";
 import { Lexer, type Token, type Tokens } from "marked";
 import { cometClient } from "./cdp-client.js";
 import type { CometAIResponse } from "./types.js";
+import { PERPLEXITY_URL } from "./session-manager.js";
 
 const MAX_EXTRACTED_RESPONSE_CHARS = 24000;
 const RESPONSE_TAIL_CHARS = 4000;
@@ -2018,7 +2019,7 @@ export class CometAI {
       return { exited: false, reason: "not in agent mode" };
     }
 
-    const newTab = await cometClient.newTab("https://www.perplexity.ai/");
+    const newTab = await cometClient.newTab(PERPLEXITY_URL);
     await cometClient.connect(newTab.id);
 
     await new Promise((r) => setTimeout(r, 1000));

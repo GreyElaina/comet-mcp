@@ -4,7 +4,7 @@ import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
 import { cometAI } from "../comet-ai.js";
 import { toTextContent, parsePositiveInt } from "./shared.js";
-import { sessionManager, SessionError } from "../session-manager.js";
+import { sessionManager, SessionError, PERPLEXITY_URL } from "../session-manager.js";
 import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
 
 const schema = z.object({
@@ -162,7 +162,7 @@ export function registerCometAskTool(server: FastMCP) {
 
         const wantsModelSwitch = (model || cometAI.getDefaultModel()) && (!mode || mode === "search");
         if (newChat || !isOnPerplexity || wantsModelSwitch) {
-          await cometClient.navigate("https://www.perplexity.ai/", true);
+          await cometClient.navigate(PERPLEXITY_URL, true);
           await new Promise(resolve => setTimeout(resolve, 2000));
         }
 
