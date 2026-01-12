@@ -2,17 +2,31 @@ import { z } from "zod";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
 import { cometAI } from "../comet-ai.js";
+import { sessionManager } from "../session-manager.js";
 
-const schema = z.object({});
+const schema = z.object({
+  hard: z.boolean().optional().describe(
+    "If true, destroy ALL sessions. If false (default), sync sessions with browser (remove orphaned)."
+  ),
+});
 
-const description = `Reset Comet to clean state: closes extra tabs, navigates to Perplexity home, returns current state (mode, model, defaultModel). Use when Comet is in a bad state or before starting fresh.`;
+const description = `Reset Comet to clean state: closes extra tabs, navigates to Perplexity home, cleans up sessions (hard=destroy all, soft=remove orphaned), returns current state (mode, model, defaultModel, session counts). Use when Comet is in a bad state or before starting fresh.`;
 
 export function registerCometResetTool(server: FastMCP) {
   server.addTool({
     name: "comet_reset",
     description,
     parameters: schema,
-    execute: async () => {
+    execute: async (args) => {
+      const hard = args.hard === true;
+      const sessionsBefore = sessionManager.getSessionCount();
+
+      if (hard) {
+        await sessionManager.destroyAllSessions();
+      } else {
+        await sessionManager.syncWithBrowser();
+      }
+
       await cometClient.startComet();
 
       const targets = await cometClient.listTargets();
@@ -42,12 +56,17 @@ export function registerCometResetTool(server: FastMCP) {
         cometAI.getModelInfo({ openMenu: false }).catch(() => null),
       ]);
 
+      const sessionsAfter = sessionManager.getSessionCount();
+
       const info = {
         status: "connected",
         mode: uiMode || "unknown",
         model: modelInfo?.currentModel || "unknown",
         defaultModel: cometAI.getDefaultModel(),
         tabsCleaned: pageTabs.length > 1 ? pageTabs.length - 1 : 0,
+        sessionsBefore,
+        sessionsAfter,
+        sessionsRemoved: sessionsBefore - sessionsAfter,
       };
 
       return JSON.stringify(info, null, 2);
