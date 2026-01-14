@@ -12,6 +12,7 @@ import type {
   CometState,
 } from "./types.js";
 import { PERPLEXITY_URL } from "./session-manager.js";
+import { cdpRwLock } from "./concurrency/locks.js";
 
 const COMET_PATH = "/Applications/Comet.app/Contents/MacOS/Comet";
 const DEFAULT_PORT = parseInt(process.env.COMET_PORT || "9222", 10);
@@ -36,6 +37,19 @@ function isRecoverableError(error: unknown): boolean {
     return true;
   }
   return false;
+}
+
+export class OperationTimeoutError extends Error {
+  constructor(
+    public readonly operation: string,
+    public readonly timeoutMs: number,
+    public readonly targetId?: string
+  ) {
+    super(
+      `Operation '${operation}' timed out after ${timeoutMs}ms${targetId ? ` (target: ${targetId})` : ""}`
+    );
+    this.name = "OperationTimeoutError";
+  }
 }
 
 export class CometCDPClient {
@@ -77,7 +91,7 @@ export class CometCDPClient {
    * Get WebSocket endpoint from CDP HTTP API
    */
   private async getWebSocketEndpoint(): Promise<string> {
-    const version = await this.getVersion();
+    const version = await this.getVersionUnlocked();
     return version.webSocketDebuggerUrl;
   }
 
@@ -235,20 +249,22 @@ export class CometCDPClient {
    * List all available tabs/targets
    */
   async listTargets(): Promise<CDPTarget[]> {
-    // Use HTTP API for listing (more reliable, works without browser connection)
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-    try {
-      const response = await fetch(`http://localhost:${this.state.port}/json/list`, {
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw new Error(`Failed to list targets: ${response.status}`);
+    return cdpRwLock.runRead(async () => {
+      // Use HTTP API for listing (more reliable, works without browser connection)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(`http://localhost:${this.state.port}/json/list`, {
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`Failed to list targets: ${response.status}`);
+        }
+        return (await response.json()) as Promise<CDPTarget[]>;
+      } finally {
+        clearTimeout(timeoutId);
       }
-      return (await response.json()) as Promise<CDPTarget[]>;
-    } finally {
-      clearTimeout(timeoutId);
-    }
+    });
   }
 
   private async createSessionForTarget(targetId: string): Promise<CDPSession> {
@@ -270,17 +286,39 @@ export class CometCDPClient {
   }
 
   async connect(targetId: string): Promise<string> {
-    const existingPromise = this.connectPromises.get(targetId);
-    if (existingPromise) {
-      return existingPromise;
-    }
+    return cdpRwLock.runWrite(async () => {
+      const existingPromise = this.connectPromises.get(targetId);
+      if (existingPromise) {
+        return existingPromise;
+      }
 
-    const connectPromise = this.doConnect(targetId).finally(() => {
-      this.connectPromises.delete(targetId);
+      const timeoutMs = 10000;
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      const connectPromise = this.doConnect(targetId).finally(() => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        this.connectPromises.delete(targetId);
+      });
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new OperationTimeoutError("connect", timeoutMs, targetId));
+        }, timeoutMs);
+      });
+
+      const racedPromise = Promise.race([connectPromise, timeoutPromise]);
+      const finalPromise = racedPromise.catch((error) => {
+        if (error instanceof OperationTimeoutError) {
+          void connectPromise.catch(() => {});
+        }
+        throw error;
+      });
+
+      this.connectPromises.set(targetId, finalPromise);
+
+      return finalPromise;
     });
-    this.connectPromises.set(targetId, connectPromise);
-
-    return connectPromise;
   }
 
   private async doConnect(targetId: string): Promise<string> {
@@ -350,12 +388,14 @@ export class CometCDPClient {
    * Disconnect from current tab
    */
   async disconnect(): Promise<void> {
-    await this.cleanupConnection();
-    this.browserSession = null;
-    if (this.browser) {
-      await this.browser.disconnect();
-      this.browser = null;
-    }
+    return cdpRwLock.runWrite(async () => {
+      await this.cleanupConnection();
+      this.browserSession = null;
+      if (this.browser) {
+        await this.browser.disconnect();
+        this.browser = null;
+      }
+    });
   }
 
   // ============================================================
@@ -452,15 +492,17 @@ export class CometCDPClient {
   }
 
   async getCurrentUrl(targetId: string): Promise<string | null> {
-    try {
-      const session = this.getSessionOrThrow(targetId);
-      const { result } = (await session.send("Runtime.evaluate", {
-        expression: "location.href",
-      })) as EvaluateResult;
-      return (result.value as string) || null;
-    } catch {
-      return null;
-    }
+    return cdpRwLock.runRead(async () => {
+      try {
+        const session = this.getSessionOrThrow(targetId);
+        const { result } = (await session.send("Runtime.evaluate", {
+          expression: "location.href",
+        })) as EvaluateResult;
+        return (result.value as string) || null;
+      } catch {
+        return null;
+      }
+    });
   }
 
   /**
@@ -539,81 +581,83 @@ export class CometCDPClient {
    * Start Comet browser with remote debugging enabled
    */
   async startComet(port: number = DEFAULT_PORT): Promise<string> {
-    this.state.port = port;
+    return cdpRwLock.runWrite(async () => {
+      this.state.port = port;
 
-    // Check if Comet is already running WITH debugging enabled
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      // Check if Comet is already running WITH debugging enabled
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000);
 
-      const response = await fetch(`http://localhost:${port}/json/version`, {
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
+        const response = await fetch(`http://localhost:${port}/json/version`, {
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
 
-      if (response.ok) {
-        const version = (await response.json()) as CDPVersion;
-        return `Comet already running with debug port: ${version.Browser}`;
+        if (response.ok) {
+          const version = (await response.json()) as CDPVersion;
+          return `Comet already running with debug port: ${version.Browser}`;
+        }
+      } catch {
+        // Debug port not available, check if Comet is running without it
+        const isRunning = await this.isCometProcessRunning();
+        if (isRunning) {
+          await this.killComet();
+        }
       }
-    } catch {
-      // Debug port not available, check if Comet is running without it
-      const isRunning = await this.isCometProcessRunning();
-      if (isRunning) {
-        await this.killComet();
-      }
-    }
 
-    // Start Comet with debugging enabled
-    return new Promise((resolve, reject) => {
-      this.cometProcess = spawn(COMET_PATH, [`--remote-debugging-port=${port}`], {
-        detached: true,
-        stdio: "ignore",
-      });
+      // Start Comet with debugging enabled
+      return new Promise((resolve, reject) => {
+        this.cometProcess = spawn(COMET_PATH, [`--remote-debugging-port=${port}`], {
+          detached: true,
+          stdio: "ignore",
+        });
 
-      this.cometProcess.unref();
+        this.cometProcess.unref();
 
-      const maxAttempts = 40;
-      let attempts = 0;
+        const maxAttempts = 40;
+        let attempts = 0;
 
-      const checkReady = async () => {
-        attempts++;
-        try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 2000);
+        const checkReady = async () => {
+          attempts++;
+          try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 2000);
 
-          const response = await fetch(`http://localhost:${port}/json/version`, {
-            signal: controller.signal,
-          });
-          clearTimeout(timeoutId);
+            const response = await fetch(`http://localhost:${port}/json/version`, {
+              signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
 
-          if (response.ok) {
-            const version = (await response.json()) as CDPVersion;
-            resolve(`Comet started with debug port ${port}: ${version.Browser}`);
-            return;
+            if (response.ok) {
+              const version = (await response.json()) as CDPVersion;
+              resolve(`Comet started with debug port ${port}: ${version.Browser}`);
+              return;
+            }
+          } catch {
+            // Keep trying
           }
-        } catch {
-          // Keep trying
-        }
 
-        if (attempts < maxAttempts) {
-          setTimeout(checkReady, 500);
-        } else {
-          reject(
-            new Error(
-              `Timeout waiting for Comet to start. Please try manually: ${COMET_PATH} --remote-debugging-port=${port}`
-            )
-          );
-        }
-      };
+          if (attempts < maxAttempts) {
+            setTimeout(checkReady, 500);
+          } else {
+            reject(
+              new Error(
+                `Timeout waiting for Comet to start. Please try manually: ${COMET_PATH} --remote-debugging-port=${port}`
+              )
+            );
+          }
+        };
 
-      setTimeout(checkReady, 1500);
+        setTimeout(checkReady, 1500);
+      });
     });
   }
 
   /**
    * Get CDP version info
    */
-  async getVersion(): Promise<CDPVersion> {
+  private async getVersionUnlocked(): Promise<CDPVersion> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
     try {
@@ -629,6 +673,10 @@ export class CometCDPClient {
     }
   }
 
+  async getVersion(): Promise<CDPVersion> {
+    return cdpRwLock.runRead(async () => this.getVersionUnlocked());
+  }
+
   // ============================================================
   // Page Operations
   // ============================================================
@@ -637,48 +685,69 @@ export class CometCDPClient {
    * Navigate to a URL
    */
   async navigate(url: string, waitForLoad: boolean, targetId: string): Promise<NavigateResult> {
-    const session = this.getSessionOrThrow(targetId);
-    const result = (await session.send("Page.navigate", { url })) as NavigateResult;
+    return cdpRwLock.runWrite(async () => {
+      const timeoutMs = 30000;
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-    if (waitForLoad) {
-      const start = Date.now();
-      while (Date.now() - start < 15000) {
-        try {
-          const ready = (await session.send("Runtime.evaluate", {
-            expression: "document.readyState",
-            returnByValue: true,
-          })) as EvaluateResult;
-          const state = (ready.result.value as string) || "";
-          if (state === "complete" || state === "interactive") break;
-        } catch {
-          // Ignore transient evaluation errors during navigation
+      const navigatePromise = (async () => {
+        const session = this.getSessionOrThrow(targetId);
+        const result = (await session.send("Page.navigate", { url })) as NavigateResult;
+
+        if (waitForLoad) {
+          const start = Date.now();
+          while (Date.now() - start < 15000) {
+            try {
+              const ready = (await session.send("Runtime.evaluate", {
+                expression: "document.readyState",
+                returnByValue: true,
+              })) as EvaluateResult;
+              const state = (ready.result.value as string) || "";
+              if (state === "complete" || state === "interactive") break;
+            } catch {
+              // Ignore transient evaluation errors during navigation
+            }
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          }
         }
-        await new Promise((resolve) => setTimeout(resolve, 200));
-      }
-    }
 
-    this.state.currentUrl = url;
-    return result;
+        this.state.currentUrl = url;
+        return result;
+      })();
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new OperationTimeoutError("navigate", timeoutMs, targetId));
+        }, timeoutMs);
+      });
+
+      return Promise.race([navigatePromise, timeoutPromise]).finally(() => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+      });
+    });
   }
 
   /**
    * Capture screenshot
    */
   async screenshot(format: "png" | "jpeg", quality: number | undefined, targetId: string): Promise<ScreenshotResult> {
-    const session = this.getSessionOrThrow(targetId);
+    return cdpRwLock.runRead(async () => {
+      const session = this.getSessionOrThrow(targetId);
 
-    const options: { format: "png" | "jpeg" | "webp"; quality?: number } = { format };
-    if (quality !== undefined && format !== "png") {
-      options.quality = quality;
-    }
+      const options: { format: "png" | "jpeg" | "webp"; quality?: number } = { format };
+      if (quality !== undefined && format !== "png") {
+        options.quality = quality;
+      }
 
-    return session.send("Page.captureScreenshot", options) as Promise<ScreenshotResult>;
+      return session.send("Page.captureScreenshot", options) as Promise<ScreenshotResult>;
+    });
   }
 
   /**
    * Execute JavaScript in the page context
    */
-  async evaluate(expression: string, targetId: string): Promise<EvaluateResult> {
+  private async evaluateUnlocked(expression: string, targetId: string): Promise<EvaluateResult> {
     const session = this.getSessionOrThrow(targetId);
 
     return session.send("Runtime.evaluate", {
@@ -688,40 +757,50 @@ export class CometCDPClient {
     }) as Promise<EvaluateResult>;
   }
 
+  async evaluate(expression: string, targetId: string): Promise<EvaluateResult> {
+    return cdpRwLock.runRead(async () => this.evaluateUnlocked(expression, targetId));
+  }
+
   /**
    * Execute JavaScript with auto-reconnect on connection loss
    */
   async safeEvaluate(expression: string, targetId: string): Promise<EvaluateResult> {
-    return this.withAutoReconnect(async () => {
-      const session = this.getSessionOrThrow(targetId);
-      return session.send("Runtime.evaluate", {
-        expression,
-        awaitPromise: true,
-        returnByValue: true,
-      }) as Promise<EvaluateResult>;
-    });
+    return this.withAutoReconnect(async () =>
+      cdpRwLock.runWrite(async () => {
+        const session = this.getSessionOrThrow(targetId);
+        return session.send("Runtime.evaluate", {
+          expression,
+          awaitPromise: true,
+          returnByValue: true,
+        }) as Promise<EvaluateResult>;
+      })
+    );
   }
 
   /**
    * Get page HTML content
    */
   async getPageContent(targetId: string): Promise<string> {
-    const result = await this.evaluate("document.documentElement.outerHTML", targetId);
-    if (result.exceptionDetails) {
-      throw new Error(result.exceptionDetails.text);
-    }
-    return result.result.value as string;
+    return cdpRwLock.runRead(async () => {
+      const result = await this.evaluateUnlocked("document.documentElement.outerHTML", targetId);
+      if (result.exceptionDetails) {
+        throw new Error(result.exceptionDetails.text);
+      }
+      return result.result.value as string;
+    });
   }
 
   /**
    * Get page text content
    */
   async getPageText(targetId: string): Promise<string> {
-    const result = await this.evaluate("document.body.innerText", targetId);
-    if (result.exceptionDetails) {
-      throw new Error(result.exceptionDetails.text);
-    }
-    return result.result.value as string;
+    return cdpRwLock.runRead(async () => {
+      const result = await this.evaluateUnlocked("document.body.innerText", targetId);
+      if (result.exceptionDetails) {
+        throw new Error(result.exceptionDetails.text);
+      }
+      return result.result.value as string;
+    });
   }
 
   // ============================================================
@@ -732,56 +811,62 @@ export class CometCDPClient {
    * Click on an element
    */
   async click(selector: string, targetId: string): Promise<boolean> {
-    const result = await this.evaluate(`
-      (function() {
-        const el = document.querySelector(${JSON.stringify(selector)});
-        if (el) {
-          el.click();
-          return true;
-        }
-        return false;
-      })()
-    `, targetId);
-    return result.result.value as boolean;
+    return cdpRwLock.runWrite(async () => {
+      const result = await this.evaluateUnlocked(`
+        (function() {
+          const el = document.querySelector(${JSON.stringify(selector)});
+          if (el) {
+            el.click();
+            return true;
+          }
+          return false;
+        })()
+      `, targetId);
+      return result.result.value as boolean;
+    });
   }
 
   /**
    * Type text into an element
    */
   async type(selector: string, text: string, targetId: string): Promise<boolean> {
-    const result = await this.evaluate(`
-      (function() {
-        const el = document.querySelector(${JSON.stringify(selector)});
-        if (el) {
-          el.focus();
-          el.value = ${JSON.stringify(text)};
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-          return true;
-        }
-        return false;
-      })()
-    `, targetId);
-    return result.result.value as boolean;
+    return cdpRwLock.runWrite(async () => {
+      const result = await this.evaluateUnlocked(`
+        (function() {
+          const el = document.querySelector(${JSON.stringify(selector)});
+          if (el) {
+            el.focus();
+            el.value = ${JSON.stringify(text)};
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          }
+          return false;
+        })()
+      `, targetId);
+      return result.result.value as boolean;
+    });
   }
 
   /**
    * Press a key
    */
   async pressKey(key: string, selector: string | undefined, targetId: string): Promise<void> {
-    const session = this.getSessionOrThrow(targetId);
+    return cdpRwLock.runWrite(async () => {
+      const session = this.getSessionOrThrow(targetId);
 
-    if (selector) {
-      await this.evaluate(`document.querySelector(${JSON.stringify(selector)})?.focus()`, targetId);
-    }
+      if (selector) {
+        await this.evaluateUnlocked(`document.querySelector(${JSON.stringify(selector)})?.focus()`, targetId);
+      }
 
-    await session.send("Input.dispatchKeyEvent", {
-      type: "keyDown",
-      key,
-    });
-    await session.send("Input.dispatchKeyEvent", {
-      type: "keyUp",
-      key,
+      await session.send("Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key,
+      });
+      await session.send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key,
+      });
     });
   }
 
@@ -790,117 +875,128 @@ export class CometCDPClient {
     modifiers: number,
     options: { code?: string; selector?: string; targetId: string }
   ): Promise<void> {
-    const session = this.getSessionOrThrow(options.targetId);
+    return cdpRwLock.runWrite(async () => {
+      const session = this.getSessionOrThrow(options.targetId);
 
-    if (options.selector) {
-      await this.evaluate(`document.querySelector(${JSON.stringify(options.selector)})?.focus()`, options.targetId);
-    }
+      if (options.selector) {
+        await this.evaluateUnlocked(
+          `document.querySelector(${JSON.stringify(options.selector)})?.focus()`,
+          options.targetId
+        );
+      }
 
-    const code = options.code;
+      const code = options.code;
 
-    await session.send("Input.dispatchKeyEvent", {
-      type: "keyDown",
-      key,
-      code,
-      modifiers,
-    });
-    await session.send("Input.dispatchKeyEvent", {
-      type: "keyUp",
-      key,
-      code,
-      modifiers,
+      await session.send("Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key,
+        code,
+        modifiers,
+      });
+      await session.send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key,
+        code,
+        modifiers,
+      });
     });
   }
 
   async insertText(text: string, targetId: string): Promise<void> {
-    const session = this.getSessionOrThrow(targetId);
-    await session.send("Input.insertText", { text });
+    return cdpRwLock.runWrite(async () => {
+      const session = this.getSessionOrThrow(targetId);
+      await session.send("Input.insertText", { text });
+    });
   }
 
   /**
    * Wait for an element to appear
    */
   async waitForSelector(selector: string, timeout: number, targetId: string): Promise<boolean> {
-    const startTime = Date.now();
+    return cdpRwLock.runRead(async () => {
+      const startTime = Date.now();
 
-    while (Date.now() - startTime < timeout) {
-      const result = await this.evaluate(`
-        document.querySelector(${JSON.stringify(selector)}) !== null
-      `, targetId);
+      while (Date.now() - startTime < timeout) {
+        const result = await this.evaluateUnlocked(`
+          document.querySelector(${JSON.stringify(selector)}) !== null
+        `, targetId);
 
-      if (result.result.value === true) {
-        return true;
+        if (result.result.value === true) {
+          return true;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-
-    return false;
+      return false;
+    });
   }
 
   /**
    * Wait for page to be idle (no pending network requests)
    */
   async waitForNetworkIdle(timeout: number, targetId: string): Promise<void> {
-    const session = this.getSessionOrThrow(targetId);
+    return cdpRwLock.runRead(async () => {
+      const session = this.getSessionOrThrow(targetId);
 
-    return new Promise((resolve) => {
-      let pendingRequests = 0;
-      let idleTimer: NodeJS.Timeout;
-      let resolved = false;
+      return new Promise((resolve) => {
+        let pendingRequests = 0;
+        let idleTimer: NodeJS.Timeout;
+        let resolved = false;
 
-      const isStale = () => this.sessions.get(targetId) !== session;
+        const isStale = () => this.sessions.get(targetId) !== session;
 
-      const cleanup = () => {
-        session.off("Network.requestWillBeSent", onRequest);
-        session.off("Network.loadingFinished", onFinished);
-        session.off("Network.loadingFailed", onFailed);
-        session.off("sessiondetached", onDetached);
-      };
+        const cleanup = () => {
+          session.off("Network.requestWillBeSent", onRequest);
+          session.off("Network.loadingFinished", onFinished);
+          session.off("Network.loadingFailed", onFailed);
+          session.off("sessiondetached", onDetached);
+        };
 
-      const finish = () => {
-        if (resolved) return;
-        resolved = true;
-        clearTimeout(idleTimer);
-        cleanup();
-        resolve();
-      };
-
-      const onDetached = () => finish();
-
-      const checkIdle = () => {
-        if (resolved || isStale()) return;
-        if (pendingRequests === 0) {
+        const finish = () => {
+          if (resolved) return;
+          resolved = true;
           clearTimeout(idleTimer);
-          idleTimer = setTimeout(finish, 500);
-        }
-      };
+          cleanup();
+          resolve();
+        };
 
-      const onRequest = () => {
-        if (resolved || isStale()) return;
-        pendingRequests++;
-        clearTimeout(idleTimer);
-      };
+        const onDetached = () => finish();
 
-      const onFinished = () => {
-        if (resolved || isStale()) return;
-        pendingRequests = Math.max(0, pendingRequests - 1);
+        const checkIdle = () => {
+          if (resolved || isStale()) return;
+          if (pendingRequests === 0) {
+            clearTimeout(idleTimer);
+            idleTimer = setTimeout(finish, 500);
+          }
+        };
+
+        const onRequest = () => {
+          if (resolved || isStale()) return;
+          pendingRequests++;
+          clearTimeout(idleTimer);
+        };
+
+        const onFinished = () => {
+          if (resolved || isStale()) return;
+          pendingRequests = Math.max(0, pendingRequests - 1);
+          checkIdle();
+        };
+
+        const onFailed = () => {
+          if (resolved || isStale()) return;
+          pendingRequests = Math.max(0, pendingRequests - 1);
+          checkIdle();
+        };
+
+        session.on("Network.requestWillBeSent", onRequest);
+        session.on("Network.loadingFinished", onFinished);
+        session.on("Network.loadingFailed", onFailed);
+        session.once("sessiondetached", onDetached);
+
+        setTimeout(finish, timeout);
         checkIdle();
-      };
-
-      const onFailed = () => {
-        if (resolved || isStale()) return;
-        pendingRequests = Math.max(0, pendingRequests - 1);
-        checkIdle();
-      };
-
-      session.on("Network.requestWillBeSent", onRequest);
-      session.on("Network.loadingFinished", onFinished);
-      session.on("Network.loadingFailed", onFailed);
-      session.once("sessiondetached", onDetached);
-
-      setTimeout(finish, timeout);
-      checkIdle();
+      });
     });
   }
 
@@ -912,24 +1008,56 @@ export class CometCDPClient {
    * Create a new tab
    */
   async newTab(url?: string): Promise<CDPTarget> {
-    const endpoint = url
-      ? `http://localhost:${this.state.port}/json/new?${encodeURIComponent(url)}`
-      : `http://localhost:${this.state.port}/json/new`;
-    const response = await fetch(endpoint, { method: "PUT" });
-    if (!response.ok) {
-      throw new Error(`Failed to create new tab: ${response.status}`);
-    }
-    return response.json() as Promise<CDPTarget>;
+    return cdpRwLock.runWrite(async () => {
+      const endpoint = url
+        ? `http://localhost:${this.state.port}/json/new?${encodeURIComponent(url)}`
+        : `http://localhost:${this.state.port}/json/new`;
+      const timeoutMs = 10000;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const response = await fetch(endpoint, { method: "PUT", signal: controller.signal });
+        if (!response.ok) {
+          throw new Error(`Failed to create new tab: ${response.status}`);
+        }
+        return response.json() as Promise<CDPTarget>;
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new OperationTimeoutError("newTab", timeoutMs);
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    });
   }
 
   /**
    * Close a tab
    */
   async closeTab(targetId: string): Promise<void> {
-    const response = await fetch(`http://localhost:${this.state.port}/json/close/${targetId}`);
-    if (!response.ok) {
-      throw new Error(`Failed to close tab: ${response.status}`);
-    }
+    return cdpRwLock.runWrite(async () => {
+      const timeoutMs = 5000;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const response = await fetch(`http://localhost:${this.state.port}/json/close/${targetId}`, {
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`Failed to close tab: ${response.status}`);
+        }
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new OperationTimeoutError("closeTab", timeoutMs, targetId);
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    });
   }
 
   /**
@@ -957,46 +1085,52 @@ export class CometCDPClient {
     files: string[],
     options: { nodeId?: number; backendNodeId?: number; objectId?: string; targetId: string }
   ): Promise<void> {
-    const session = this.getSessionOrThrow(options.targetId);
-    await session.send("DOM.setFileInputFiles", {
-      files,
-      nodeId: options.nodeId,
-      backendNodeId: options.backendNodeId,
-      objectId: options.objectId,
+    return cdpRwLock.runWrite(async () => {
+      const session = this.getSessionOrThrow(options.targetId);
+      await session.send("DOM.setFileInputFiles", {
+        files,
+        nodeId: options.nodeId,
+        backendNodeId: options.backendNodeId,
+        objectId: options.objectId,
+      });
     });
   }
 
   async getNodeId(selector: string, targetId: string): Promise<number | null> {
-    const session = this.getSessionOrThrow(targetId);
-    const doc = await session.send("DOM.getDocument");
-    const result = await session.send("DOM.querySelector", {
-      nodeId: doc.root.nodeId,
-      selector,
+    return cdpRwLock.runRead(async () => {
+      const session = this.getSessionOrThrow(targetId);
+      const doc = await session.send("DOM.getDocument");
+      const result = await session.send("DOM.querySelector", {
+        nodeId: doc.root.nodeId,
+        selector,
+      });
+      return result.nodeId || null;
     });
-    return result.nodeId || null;
   }
 
   async getBackendNodeId(selector: string, targetId: string): Promise<number | null> {
-    const session = this.getSessionOrThrow(targetId);
-    const result = await this.evaluate(`
-      (() => {
-        const el = document.querySelector(${JSON.stringify(selector)});
-        return el ? true : false;
-      })()
-    `, targetId);
-    if (!result.result.value) return null;
+    return cdpRwLock.runRead(async () => {
+      const session = this.getSessionOrThrow(targetId);
+      const result = await this.evaluateUnlocked(`
+        (() => {
+          const el = document.querySelector(${JSON.stringify(selector)});
+          return el ? true : false;
+        })()
+      `, targetId);
+      if (!result.result.value) return null;
 
-    const doc = await session.send("DOM.getDocument");
-    const queryResult = await session.send("DOM.querySelector", {
-      nodeId: doc.root.nodeId,
-      selector,
-    });
-    if (!queryResult.nodeId) return null;
+      const doc = await session.send("DOM.getDocument");
+      const queryResult = await session.send("DOM.querySelector", {
+        nodeId: doc.root.nodeId,
+        selector,
+      });
+      if (!queryResult.nodeId) return null;
 
-    const nodeDesc = await session.send("DOM.describeNode", {
-      nodeId: queryResult.nodeId,
+      const nodeDesc = await session.send("DOM.describeNode", {
+        nodeId: queryResult.nodeId,
+      });
+      return nodeDesc.node.backendNodeId || null;
     });
-    return nodeDesc.node.backendNodeId || null;
   }
 
   // ============================================================

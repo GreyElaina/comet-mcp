@@ -2,6 +2,7 @@ import { z } from "zod";
 import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
+import { resetState } from "../concurrency/reset-state.js";
 import { parsePositiveInt } from "./shared.js";
 import { sessionManager, SessionError } from "../session-manager.js";
 import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
@@ -32,6 +33,10 @@ export function registerCometPollTool(server: FastMCP) {
     description,
     parameters: schema,
     execute: async (args) => {
+      if (resetState.isResetting()) {
+        return JSON.stringify({ status: "blocked", reason: "reset in progress" }, null, 2);
+      }
+
        let session: SessionState;
        if (args.session) {
          if (!sessionManager.validateSessionName(args.session)) {

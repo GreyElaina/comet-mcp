@@ -2,6 +2,7 @@ import { z } from "zod";
 import { UserError } from "fastmcp";
 import type { FastMCP } from "fastmcp";
 import { cometClient } from "../cdp-client.js";
+import { resetState } from "../concurrency/reset-state.js";
 import { toTextContent, parsePositiveInt } from "./shared.js";
 import { sessionManager, SessionError, PERPLEXITY_URL } from "../session-manager.js";
 import { SessionState, INVALID_SESSION_NAME_ERROR } from "../types.js";
@@ -82,6 +83,15 @@ export function registerCometAskTool(server: FastMCP) {
     description,
     parameters: schema,
     execute: async (args: CometAskArgs, context: ExecuteContext) => {
+      if (resetState.isResetting()) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Task blocked: reset in progress. Retry later.",
+          }],
+        };
+      }
+
       const { reportProgress } = context;
 
       let session: SessionState;
@@ -295,6 +305,19 @@ export function registerCometAskTool(server: FastMCP) {
       log('Task started');
 
       while (Date.now() - startTime < timeout) {
+        if (resetState.isResetting()) {
+          try {
+            await session.ai.stopAgent();
+          } catch {
+          }
+          return {
+            content: [{
+              type: "text" as const,
+              text: "Task blocked: reset in progress. Retry later.",
+            }],
+          };
+        }
+
         const elapsedMs = Date.now() - startTime;
         const pollMs = elapsedMs < 2500 ? 500 : elapsedMs < 8000 ? 1200 : 2000;
         await sleep(pollMs);
